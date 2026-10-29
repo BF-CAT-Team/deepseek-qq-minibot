@@ -181,7 +181,7 @@ dotnet run --project tests/Bot.Tests
 
 ## 许可
 
-[MIT](LICENSE)
+[MIT](LICENSE.md)
 
 ---
 
