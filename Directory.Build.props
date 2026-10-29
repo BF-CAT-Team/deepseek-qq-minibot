@@ -1,0 +1,16 @@
+<Project>
+
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+    <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
+    <Company>ChatBot</Company>
+    <Product>ChatBot</Product>
+    <Version>1.2.0</Version>
+  </PropertyGroup>
+
+</Project>

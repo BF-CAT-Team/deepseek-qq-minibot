@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Bot.App/Bot.App.csproj" />
+    <Project Path="src/Bot.Core/Bot.Core.csproj" />
+    <Project Path="src/Bot.QQ/Bot.QQ.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Bot.Tests/Bot.Tests.csproj" />
+  </Folder>
+</Solution>
