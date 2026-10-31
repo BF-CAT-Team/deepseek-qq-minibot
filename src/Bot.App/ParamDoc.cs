@@ -104,7 +104,6 @@ public static class ParamDoc
         b.AppendLine("    \"appId\": \"…\",");
         b.AppendLine("    \"secret\": \"…\",");
         b.AppendLine("    \"sandbox\": false,               // 沙箱环境");
-        b.AppendLine("    \"receivesAllMessages\": false,   // 群主已开「接收所有消息」时的手动兜底");
         b.AppendLine("    \"extraIntents\": 0               // 额外订阅位，一般留 0");
         b.AppendLine("  },");
         b.AppendLine("  \"persona\": {");
@@ -131,14 +130,25 @@ public static class ParamDoc
                         + "`需重启` = 必须退出程序再启动才生效。");
         b.AppendLine();
 
-        var order = new[]
+        // 先按阅读顺序列出已知分组，再兜底追加任何新分组——
+        // 以前这里是硬编码数组，新增「表情包」后整组参数被静默漏掉。
+        var order = new List<string>
         {
             ParamRegistry.CatTrigger,
             ParamRegistry.CatMemory,
             ParamRegistry.CatDialogue,
+            ParamRegistry.CatSticker,
             ParamRegistry.CatOps,
             ParamRegistry.CatRuntime,
         };
+
+        foreach (var category in ParamRegistry.All.Select(spec => spec.Category))
+        {
+            if (!order.Contains(category))
+            {
+                order.Add(category);
+            }
+        }
 
         foreach (var category in order)
         {
@@ -224,7 +234,7 @@ public static class ParamDoc
         b.AppendLine("1. `active_tick_sec` 调大或关闭（影响最大：每次主动接话都是完整一次调用）；");
         b.AppendLine("2. `session_max_turns` 调小、`session_token_cap` 调小（会话更短，但冷启动变多）；");
         b.AppendLine("3. `event_topk` 调小、`person_memory_limit` 调小（前缀更小，冷启动更便宜）；");
-        b.AppendLine("4. `reply_length` 设「极简」（只省约 8% 输出，优先级最低）。");
+        b.AppendLine("4. `reply_length` 调小（例如 20 字；会重建会话，收益主要是输出 token）。");
         b.AppendLine();
         b.AppendLine("### 「聊着聊着就断片」");
         b.AppendLine();

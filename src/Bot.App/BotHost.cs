@@ -43,6 +43,12 @@ public sealed class BotHost : IAsyncDisposable
 
     public TokenEstimator Estimator { get; } = new();
 
+    /// <summary>三区组装器：运行时与调参页的提示词预览共用同一套规则。</summary>
+    public PromptAssembler Assembler { get; private set; } = null!;
+
+    /// <summary>只读：按当前参数渲染提示词框架（调参页用，不读取真实会话）。</summary>
+    public PromptFrameworkService Framework { get; private set; } = null!;
+
     public MemoryOpLog OpLog { get; private set; } = null!;
 
     public IdentityService Identity { get; private set; } = null!;
@@ -52,6 +58,12 @@ public sealed class BotHost : IAsyncDisposable
     public RetrievalService Retrieval { get; private set; } = null!;
 
     public SessionManager Sessions { get; private set; } = null!;
+
+    /// <summary>表情包图片库（图片落盘 + 元数据入库）。</summary>
+    public StickerStore Stickers { get; private set; } = null!;
+
+    /// <summary>只读：把某个会话当时发给 API 的 messages 还原出来（配置页"当前会话"用）。</summary>
+    public SessionInspector Inspector { get; private set; } = null!;
 
     public WalStore Wal { get; private set; } = null!;
 
@@ -89,10 +101,20 @@ public sealed class BotHost : IAsyncDisposable
 
         OpLog = new MemoryOpLog(Db);
         Identity = new IdentityService(Db, Config, SystemClock.Instance, OpLog);
+        var clearedNames = Identity.CleanupDuplicateNames();
+        if (clearedNames > 0)
+        {
+            Log.LogInformation("启动清理：{Count} 个重名人物已清掉名字（保留 person_id 更小的）", clearedNames);
+        }
+
         Events = new EventStore(Db, SystemClock.Instance, OpLog, LoggerFactory.CreateLogger<EventStore>());
         Retrieval = new RetrievalService(Events, new BigramTokenizer(), LoggerFactory.CreateLogger<RetrievalService>());
         Sessions = new SessionManager(Db, SystemClock.Instance, LoggerFactory.CreateLogger<SessionManager>());
+        Stickers = new StickerStore(Db, AppPaths.StickerDirectory);
         Wal = new WalStore(Db);
+        Inspector = new SessionInspector(Db, Sessions, new RequestLogStore(Db), Estimator);
+        Assembler = new PromptAssembler(Estimator);
+        Framework = new PromptFrameworkService(Config, Assembler, Estimator);
 
         var summaryApplier = new SummaryApplier(
             Db, Identity, Events, OpLog, SystemClock.Instance, LoggerFactory.CreateLogger<SummaryApplier>());
@@ -105,7 +127,7 @@ public sealed class BotHost : IAsyncDisposable
             Identity,
             Events,
             Retrieval,
-            new PromptAssembler(Estimator),
+            Assembler,
             Sessions,
             new RequestLogStore(Db),
             Wal,
@@ -113,7 +135,8 @@ public sealed class BotHost : IAsyncDisposable
             Estimator,
             Adapter,
             _models,
-            LoggerFactory.CreateLogger<ChatRuntime>());
+            LoggerFactory.CreateLogger<ChatRuntime>(),
+            stickers: Stickers);
 
         Adapter.MessageReceived += message => Runtime.EnqueueAsync(message);
 

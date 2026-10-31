@@ -3,7 +3,7 @@ namespace Bot.Core.Memory;
 /// <summary>文档 3.6 的 DDL。除原文列之外只加了两处：<c>chat.kind</c> 与 <c>person.union_open_id</c>（见注释）。</summary>
 public static class Schema
 {
-    public const int CurrentVersion = 1;
+    public const int CurrentVersion = 2;
 
     public const string Ddl = """
         -- 群/会话配置
@@ -228,5 +228,40 @@ public static class Schema
           cooldown_until INTEGER,
           updated_at     INTEGER NOT NULL
         );
+
+        -- 表情包：图片落在 data\stickers\，这里只存元数据。
+        -- 关键词支持「词」或「词:权重」两种写法；同一次回复里同一个词出现几次就算几次。
+        -- 触发最低权重是全局参数（sticker_min_weight），不再按图单独设置；
+        -- send_count / last_sent_at 记录这张图被真正发出去过多少次、最近一次什么时候。
+        CREATE TABLE IF NOT EXISTS sticker (
+          sticker_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+          file_name     TEXT NOT NULL,
+          original_name TEXT NOT NULL DEFAULT '',
+          content_type  TEXT NOT NULL DEFAULT 'image/png',
+          keywords      TEXT NOT NULL DEFAULT '',
+          enabled       INTEGER NOT NULL DEFAULT 1,
+          send_count    INTEGER NOT NULL DEFAULT 0,
+          last_sent_at  INTEGER,
+          created_at    INTEGER NOT NULL,
+          updated_at    INTEGER NOT NULL
+        );
+
+        -- 表情包命中/跳过/失败记录（配置页「最近命中」用）。
+        -- 独立于 message / session_turn：表情包永远不进入对话历史。
+        CREATE TABLE IF NOT EXISTS sticker_log (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          chat_id       TEXT NOT NULL,
+          sticker_id    INTEGER NOT NULL,
+          keywords      TEXT NOT NULL DEFAULT '',
+          score         REAL NOT NULL,
+          threshold     REAL NOT NULL,
+          probability   REAL NOT NULL,
+          roll          REAL NOT NULL,
+          result        TEXT NOT NULL,
+          mode          TEXT NOT NULL,
+          reply_excerpt TEXT NOT NULL DEFAULT '',
+          created_at    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_sticker_log_chat ON sticker_log(chat_id, created_at);
         """;
 }

@@ -16,6 +16,9 @@ public static class AppPaths
 
     public static string LogDirectory => Path.Combine(Root, "logs");
 
+    /// <summary>表情包图片目录（配置页上传的图片落在这里）。</summary>
+    public static string StickerDirectory => Path.Combine(Root, "stickers");
+
     public static bool IsPortable { get; private set; }
 
     private static string Resolve()

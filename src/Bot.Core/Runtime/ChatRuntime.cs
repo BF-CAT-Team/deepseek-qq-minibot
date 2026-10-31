@@ -33,6 +33,7 @@ public sealed class ChatRuntime : IAsyncDisposable
     private readonly ModelProvider _models;
     private readonly ILogger<ChatRuntime> _log;
     private readonly TriggerEngine _trigger;
+    private readonly StickerStore? _stickers;
 
     private readonly ConcurrentDictionary<string, ChatState> _chats = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _cts = new();
@@ -55,7 +56,8 @@ public sealed class ChatRuntime : IAsyncDisposable
         IChatAdapter adapter,
         ModelProvider models,
         ILogger<ChatRuntime>? log = null,
-        TriggerEngine? trigger = null)
+        TriggerEngine? trigger = null,
+        StickerStore? stickers = null)
     {
         _db = db;
         _clock = clock;
@@ -72,10 +74,14 @@ public sealed class ChatRuntime : IAsyncDisposable
         _adapter = adapter;
         _models = models;
         _trigger = trigger ?? new TriggerEngine();
+        _stickers = stickers;
         _log = log ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<ChatRuntime>.Instance;
     }
 
     public int TickIntervalMs { get; set; } = 250;
+
+    /// <summary>表情包概率掷骰子。默认随机；测试可替换成固定值。</summary>
+    public Func<double> StickerRoll { get; set; } = static () => Random.Shared.NextDouble();
 
     /// <summary>未读缓冲的硬上限，防内存失控；真正的过期由 backfill_window_min 控制。</summary>
     private const int UnseenCapacity = 200;
@@ -131,7 +137,39 @@ public sealed class ChatRuntime : IAsyncDisposable
     /// <summary>入站入口。适配器必须尽快返回，重活丢给调度循环。</summary>
     public Task EnqueueAsync(IncomingMessage message)
     {
+        // 指令消息不进对话、不触发模型。
+        if (!message.IsSelf && NameCommand.TryParse(message.Content, out var requestedName))
+        {
+            return HandleNameCommandAsync(message, requestedName);
+        }
+
+        // 纯表情 / 纯占位符（[表情]）不进入任何缓冲、历史或数据库。
+        if (TriggerEngine.IsOnlyNoise(message.Content))
+        {
+            _log.LogInformation("[{Chat}] 收到纯表情/占位内容，已忽略", Mask(message.ChatId));
+            return Task.CompletedTask;
+        }
+
         var state = _chats.GetOrAdd(message.ChatId, id => new ChatState(id));
+
+        // 接收模式只看平台事件：GROUP_MESSAGE_CREATE = 群主开了全量，GROUP_AT_MESSAGE_CREATE = 仅 @。
+        // 不再依赖手动开关——手动开了但群没开时，会把"仅 @"的群误当成能旁听全群。
+        if (message.Kind == ChatKind.Group)
+        {
+            if (string.Equals(message.EventType, "GROUP_MESSAGE_CREATE", StringComparison.OrdinalIgnoreCase))
+            {
+                state.ReceivesAllGroupMessages = true;
+            }
+            else if (string.Equals(message.EventType, "GROUP_AT_MESSAGE_CREATE", StringComparison.OrdinalIgnoreCase))
+            {
+                state.ReceivesAllGroupMessages = false;
+            }
+            else
+            {
+                state.ReceivesAllGroupMessages ??= _adapter.Capabilities.ReceivesAllGroupMessages ? true : null;
+            }
+        }
+
         var botLabel = _config.Raw.Persona.BotName;
         var cfg = _config.ForChat(message.ChatId);
 
@@ -177,6 +215,57 @@ public sealed class ChatRuntime : IAsyncDisposable
         return Task.CompletedTask;
     }
 
+    /// <summary>`名字=XXX`：直接改档案并回一句，不调用模型、不进历史。没有档案时按 open_id 建档。</summary>
+    private async Task HandleNameCommandAsync(IncomingMessage message, string requestedName)
+    {
+        try
+        {
+            var check = NameRules.Check(requestedName, _config.Raw.Persona.BotName);
+            if (!check.Ok)
+            {
+                await SendCommandReplyAsync(message, $"名字没改成：{check.Reason}");
+                return;
+            }
+
+            var person = _identity.EnsurePerson(message.OpenId, message.UnionOpenId, string.Empty);
+            var result = _identity.TryApplyName(person.PersonId, check.Name, "manual");
+
+            var reply = result.Ok
+                ? (result.Changed ? $"名字已改为「{result.Name}」" : $"名字已经是「{result.Name}」")
+                : $"名字没改成：{result.Message}";
+
+            await SendCommandReplyAsync(message, reply);
+            _log.LogInformation("[{Chat}] 收到名字指令：{Reply}", Mask(message.ChatId), reply);
+        }
+        catch (OperationCanceledException)
+        {
+            // 关闭中
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[{Chat}] 名字指令执行失败", Mask(message.ChatId));
+        }
+    }
+
+    private async Task SendCommandReplyAsync(IncomingMessage source, string content)
+    {
+        try
+        {
+            await _adapter.SendAsync(new OutgoingMessage(
+                source.ChatId,
+                source.Kind,
+                content,
+                // 指令回复必须是被动回复（带 msg_id），否则在未开启全量接收的群里会被当成主动消息拒发。
+                // 不带 MentionOpenId：QQ 群文本消息不支持嵌入 @，带标签会原样显示。
+                ReplyToMessageId: source.MessageId), _cts.Token)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[{Chat}] 指令回复发送失败", Mask(source.ChatId));
+        }
+    }
+
     /// <summary>调度一次。测试可以直接调用，不必等待定时器。</summary>
     public async Task TickAsync()
     {
@@ -212,13 +301,18 @@ public sealed class ChatRuntime : IAsyncDisposable
     /// <summary>到点了就主动接一次话（只在全量模式、会话已激活、且有新群聊时）。</summary>
     private async Task CheckCadenceAsync(ChatState state, DateTimeOffset now)
     {
+        if (state.Kind != ChatKind.Group)
+        {
+            return; // 主动接话只针对群聊
+        }
+
         var cfg = _config.ForChat(state.ChatId);
         if (cfg.ActiveTickSec <= 0 || IsPaused(state.ChatId))
         {
             return;
         }
 
-        if (!_adapter.Capabilities.ReceivesAllGroupMessages)
+        if (!CanHearAllGroupMessages(state))
         {
             return; // 收不到全群发言时，主动接话没有素材
         }
@@ -231,6 +325,13 @@ public sealed class ChatRuntime : IAsyncDisposable
 
         lock (state.Sync)
         {
+            // 有消息排队等触发时，先让 FireAsync 处理：
+            // 否则节拍可能先把这条 @ 消息汇总回复一次，防抖结束后 @ 再回一次，造成重复回复。
+            if (state.Pending.Count > 0)
+            {
+                return;
+            }
+
             if (state.Unseen.Count == 0)
             {
                 return;
@@ -265,6 +366,12 @@ public sealed class ChatRuntime : IAsyncDisposable
             IncomingMessage[] batch;
             lock (state.Sync)
             {
+                // 拿 Gate 期间可能又来了新消息（包括 @）；有 pending 就让触发路径先处理。
+                if (state.Pending.Count > 0)
+                {
+                    return;
+                }
+
                 if (state.Unseen.Count == 0)
                 {
                     return;
@@ -312,12 +419,15 @@ public sealed class ChatRuntime : IAsyncDisposable
         _chats.Values.Select(state => new ChatSnapshot(
                 state.ChatId,
                 state.Kind,
+                state.DisplayName,
                 state.Session?.SessionId,
                 state.Session?.State ?? SessionState.Idle,
                 state.Session?.TurnCount ?? 0,
                 state.Pending.Count,
                 state.CooldownUntil,
-                state.Session?.PrefixHash))
+                state.Session?.PrefixHash,
+                state.Session?.LastActivityAt,
+                state.ReceivesAllGroupMessages))
             .ToArray();
 
     /// <summary>强制对某个群立即轮换（配置页"重建会话"按钮）。</summary>
@@ -504,12 +614,16 @@ public sealed class ChatRuntime : IAsyncDisposable
             return new TriggerContext(
                 _clock.UtcNow,
                 state.Recent.ToArray(),
-                _adapter.Capabilities.ReceivesAllGroupMessages,
+                CanHearAllGroupMessages(state),
                 state.ConsecutiveUnanswered,
                 state.CooldownUntil,
                 _config.Raw.Persona.BotName);
         }
     }
+
+    /// <summary>这个群是否真的能收到全量消息：优先用平台事件推出来的每群状态，未知时才退回适配器能力。</summary>
+    private bool CanHearAllGroupMessages(ChatState state) =>
+        state.ReceivesAllGroupMessages ?? _adapter.Capabilities.ReceivesAllGroupMessages;
 
     // ------------------------------------------------------------------ 会话开合
 
@@ -517,16 +631,15 @@ public sealed class ChatRuntime : IAsyncDisposable
     {
         var session = _sessions.Start(state.ChatId);
 
-        var personIds = batch
-            .Select(m => state.Labels.TryGetValue(m.OpenId, out var label) ? _identity.ResolveByLabel(state.ChatId, label) : null)
-            .Where(p => p is not null && p.Materialized)
-            .Select(p => p!.PersonId)
-            .Distinct()
-            .ToArray();
-
+        // 冷启动加载"这一轮真正相关的人"：发言者 + 消息内容里点到名的人。
+        // 不再把群成员画像全塞进前缀；没参与当前对话的档案不占 token、不干扰模型。
         var queryText = string.Join('\n', batch.Select(m => m.Content));
+        var persons = _identity.ListInvolved(state.ChatId, batch.Select(m => m.OpenId), queryText)
+            .Where(HasProfile)
+            .ToArray();
+        var personIds = persons.Select(p => p.PersonId).ToArray();
+
         var retrieved = _retrieval.Retrieve(state.ChatId, queryText, personIds, cfg);
-        var persons = _identity.ListForPrefix(state.ChatId);
 
         var prefix = _assembler.BuildPrefix(
             state.ChatId,
@@ -557,7 +670,7 @@ public sealed class ChatRuntime : IAsyncDisposable
         // 清掉会让"首条消息"在动态尾部显示成 群友??。标签只在收到新消息时按需刷新。
 
         _log.LogInformation("[{Chat}] 开新会话 {Session}｜前缀 {Tokens} token｜注入事件 {Events} 条｜人物 {Persons} 人{Trimmed}｜冷启动",
-            Mask(state.ChatId), session.SessionId, prefix.Tokens, retrieved.Count, persons.Count,
+            Mask(state.ChatId), session.SessionId, prefix.Tokens, retrieved.Count, persons.Length,
             prefix.PersonsTrimmed > 0 ? $"（按预算裁掉 {prefix.PersonsTrimmed} 人）" : string.Empty);
 
         return session;
@@ -673,13 +786,24 @@ public sealed class ChatRuntime : IAsyncDisposable
             _log.LogInformation("[{Chat}] 这批消息已超过 4.5 分钟，改按主动消息发送（不带 msg_id）", Mask(state.ChatId));
         }
 
-        await DeliverAsync(state, plan, mentionOpenId, idemKey, replyTo, cfg).ConfigureAwait(false);
+        var delivered = await DeliverAsync(state, plan, mentionOpenId, idemKey, replyTo, cfg).ConfigureAwait(false);
 
         _requestLog.MarkConfirmed(requestId,
             result.Usage.CompletionTokens,
             result.Usage.PromptTokens,
             result.Usage.CacheHitTokens,
-            result.Usage.CacheMissTokens);
+            result.Usage.CacheMissTokens,
+            result.LatencyMs);
+
+        // 表情包只在正文真的发出去之后补一张；它不追加回合、不写 message 表，
+        // 所以模型下一轮完全不知道发过图（需求：表情包不纳入原有对话）。
+        // QQ 同一个 msg_id 最多回 5 次：已经用满 5 条气泡时就别再补图，否则会被接口拒掉。
+        var hasStickerRoom = replyTo is null || plan.Bubbles.Count < 5;
+        if (delivered && hasStickerRoom)
+        {
+            await TrySendStickerAsync(state, string.Join('\n', plan.Bubbles), replyTo, idemKey, cfg)
+                .ConfigureAwait(false);
+        }
 
         // 连续无人接话 → 静默冷却（文档 3.1.2）
         state.ConsecutiveUnanswered++;
@@ -718,47 +842,28 @@ public sealed class ChatRuntime : IAsyncDisposable
         var persons = new List<PersonRow>();
         var events = new List<EventRow>();
 
-        var speakerIds = batch
-            .Select(m => state.Labels.TryGetValue(m.OpenId, out var label) ? _identity.ResolveByLabel(state.ChatId, label) : null)
-            .Where(p => p is not null)
-            .Select(p => p!.PersonId)
-            .Distinct()
-            .ToArray();
+        var query = string.Join('\n', batch.Select(m => m.Content));
+        var involved = _identity.ListInvolved(state.ChatId, batch.Select(m => m.OpenId), query).ToArray();
+        var involvedIds = involved.Select(p => p.PersonId).ToArray();
 
-        foreach (var personId in speakerIds)
+        foreach (var person in involved.Where(HasProfile))
         {
             if (persons.Count + events.Count >= limit)
             {
                 break;
             }
 
-            if (state.PrefixPersonIds.Contains(personId) || state.TailPersonIds.Contains(personId))
+            if (state.PrefixPersonIds.Contains(person.PersonId) || state.TailPersonIds.Contains(person.PersonId))
             {
                 continue;
             }
 
-            var row = _identity.GetPerson(personId);
-            if (row is null)
-            {
-                continue;
-            }
-
-            // 一条信息都没有的"空档案"补上去只是浪费 token。
-            if (string.IsNullOrWhiteSpace(row.Name)
-                && string.IsNullOrWhiteSpace(row.MemoryText)
-                && string.IsNullOrWhiteSpace(row.Personality)
-                && string.IsNullOrWhiteSpace(row.Evaluation))
-            {
-                continue;
-            }
-
-            persons.Add(row);
+            persons.Add(person);
         }
 
         if (persons.Count + events.Count < limit)
         {
-            var query = string.Join('\n', batch.Select(m => m.Content));
-            foreach (var hit in _retrieval.Retrieve(state.ChatId, query, speakerIds, cfg)
+            foreach (var hit in _retrieval.Retrieve(state.ChatId, query, involvedIds, cfg)
                          .OrderByDescending(h => h.Score))
             {
                 if (persons.Count + events.Count >= limit)
@@ -788,23 +893,6 @@ public sealed class ChatRuntime : IAsyncDisposable
         IReadOnlyList<IncomingMessage> background, IReadOnlyList<PersonRow> extraPersons,
         IReadOnlyList<EventRow> extraEvents, EffectiveConfig cfg)
     {
-        List<(string Label, int Count)> activity;
-        string? lastSpeaker;
-        lock (state.Sync)
-        {
-            var since = _clock.UtcNow.AddMinutes(-10);
-            activity = state.Recent
-                .Where(m => !m.IsSelf && m.Timestamp >= since)
-                .GroupBy(m => LabelOfLocked(state, m))
-                .Select(g => (Label: g.Key, Count: g.Count()))
-                .OrderByDescending(item => item.Count)
-                .ThenBy(item => item.Label, StringComparer.Ordinal)
-                .Take(5)
-                .ToList();
-
-            lastSpeaker = state.Recent.LastOrDefault(m => !m.IsSelf) is { } last ? LabelOfLocked(state, last) : null;
-        }
-
         var tailMessages = batch.Select(m => new TailMessage(LabelOfLocked(state, m), m.Content)).ToArray();
         var backgroundMessages = background.Select(m => new TailMessage(LabelOfLocked(state, m), m.Content)).ToArray();
 
@@ -813,8 +901,6 @@ public sealed class ChatRuntime : IAsyncDisposable
             state.DisplayName,
             state.Kind,
             _clock.UtcNow,
-            state.Kind == ChatKind.Group ? activity : Array.Empty<(string, int)>(),
-            lastSpeaker,
             tailMessages,
             cfg.ReplyLength,
             backgroundMessages,
@@ -822,7 +908,7 @@ public sealed class ChatRuntime : IAsyncDisposable
             extraEvents));
     }
 
-    private async Task DeliverAsync(ChatState state, ReplyPlan plan, string? mentionOpenId, string idemKey,
+    private async Task<bool> DeliverAsync(ChatState state, ReplyPlan plan, string? mentionOpenId, string idemKey,
         string? replyToMessageId, EffectiveConfig cfg)
     {
         var delay = Delivery.TypingDelay(plan.Bubbles[0], cfg);
@@ -834,7 +920,7 @@ public sealed class ChatRuntime : IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                return;
+                return false;
             }
         }
 
@@ -851,7 +937,7 @@ public sealed class ChatRuntime : IAsyncDisposable
                     }
                     catch (OperationCanceledException)
                     {
-                        return;
+                        return false;
                     }
                 }
             }
@@ -873,9 +959,143 @@ public sealed class ChatRuntime : IAsyncDisposable
                 _log.LogError(ex, "[{Chat}] 气泡发送失败", Mask(state.ChatId));
                 _wal.Add(state.Session?.SessionId ?? "-", WalStore.KindSend,
                     System.Text.Json.JsonSerializer.Serialize(message));
-                break;
+                return false;
             }
         }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 正文发出后按关键词匹配图片库，可能追加一张表情包。
+    /// <para>
+    /// 顺序：算分（命中次数 × 关键词权重）→ 未启用 / 未过阈值淘汰 → 取得分最高（同分取 id 小的）
+    /// → 全局概率掷骰子 → 发送。发送失败只记日志，不影响已经发出的回复。
+    /// </para>
+    /// <para>
+    /// 被动 / 主动：带 msg_id 是 QQ 的被动回复（@ 模式、全量模式下 5 分钟内的普通回复都走这条）；
+    /// 主动接话或消息超过 4.5 分钟时没有 msg_id，只能按主动消息发，可用参数关掉。
+    /// </para>
+    /// </summary>
+    private async Task TrySendStickerAsync(ChatState state, string replyText, string? replyToMessageId,
+        string idemKey, EffectiveConfig cfg)
+    {
+        if (_stickers is null || !cfg.StickerEnabled)
+        {
+            return;
+        }
+
+        StickerScore? best = null;
+        var roll = 0d;
+        var probability = cfg.StickerProbability;
+        var mode = string.IsNullOrWhiteSpace(replyToMessageId) ? "active" : "passive";
+
+        try
+        {
+            var now = _clock.UtcNow;
+
+            if (cfg.StickerCooldownSec > 0
+                && _stickers.LastSentAt(state.ChatId) is { } lastSent
+                && now - lastSent < TimeSpan.FromSeconds(cfg.StickerCooldownSec))
+            {
+                return;
+            }
+
+            var stickers = _stickers.List(enabledOnly: true);
+            if (stickers.Count == 0)
+            {
+                return;
+            }
+
+            best = StickerMatch.Best(StickerMatch.Score(replyText, stickers, cfg.StickerMinWeight));
+            if (best is null)
+            {
+                return;
+            }
+
+            if (mode == "active" && !cfg.StickerActiveWhenNoMsg)
+            {
+                LogSticker(best, 0, "skipped_active", mode);
+                _log.LogInformation("[{Chat}] 表情包跳过：这一轮没有可被动回复的 msg_id，且主动发送已关闭",
+                    Mask(state.ChatId));
+                return;
+            }
+
+            roll = StickerRoll();
+            if (roll >= probability)
+            {
+                LogSticker(best, roll, "skipped_probability", mode);
+                return;
+            }
+
+            var path = _stickers.ResolvePath(best.Sticker);
+            if (path is null)
+            {
+                LogSticker(best, roll, "failed", mode);
+                _log.LogWarning("[{Chat}] 表情包 #{Id} 的图片文件不见了，已跳过",
+                    Mask(state.ChatId), best.Sticker.StickerId);
+                return;
+            }
+
+            // 和上一条气泡之间留一点空隙，别像同时甩出来的。
+            var gap = Delivery.BubbleGap(cfg);
+            if (gap > TimeSpan.Zero)
+            {
+                await Task.Delay(gap, _cts.Token).ConfigureAwait(false);
+            }
+
+            var outgoing = new OutgoingMessage(
+                state.ChatId,
+                state.Kind,
+                string.Empty,
+                null,
+                replyToMessageId,
+                $"{idemKey}:sticker",
+                new OutgoingSticker(best.Sticker.StickerId, path, best.Sticker.ContentType, best.Sticker.OriginalName));
+
+            await _adapter.SendAsync(outgoing, _cts.Token).ConfigureAwait(false);
+
+            _stickers.MarkSent(best.Sticker.StickerId, now);
+            LogSticker(best, roll, "sent", mode);
+
+            _log.LogInformation(
+                "[{Chat}] 表情包 #{Id} 已发送（得分 {Score}/{Threshold}，roll {Roll:F2} < {Probability:F2}，{Mode}）",
+                Mask(state.ChatId), best.Sticker.StickerId, best.Score, best.Threshold, roll, probability,
+                mode == "passive" ? "被动回复" : "主动消息");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[{Chat}] 表情包发送失败（正文已正常发出）", Mask(state.ChatId));
+            if (best is not null)
+            {
+                LogSticker(best, roll, "failed", mode);
+            }
+        }
+
+        void LogSticker(StickerScore score, double rollValue, string result, string sendMode)
+        {
+            _stickers!.Log(new StickerAttempt(
+                state.ChatId,
+                score.Sticker.StickerId,
+                score.Sticker.Keywords,
+                score.Score,
+                score.Threshold,
+                probability,
+                rollValue,
+                result,
+                sendMode,
+                ClipForLog(replyText, 80),
+                _clock.UtcNow));
+        }
+    }
+
+    private static string ClipForLog(string text, int limit)
+    {
+        var flat = text.Replace('\n', ' ').Trim();
+        return flat.Length <= limit ? flat : flat[..limit] + "…";
     }
 
     // ------------------------------------------------------------------ 轮换
@@ -1011,11 +1231,12 @@ public sealed class ChatRuntime : IAsyncDisposable
         }
 
         _db.Exec(
-            "UPDATE request_log SET parse_ok=@ok, prompt_tokens=@p, cache_hit_tokens=@h, completion_tokens=@c WHERE request_id=@id",
+            "UPDATE request_log SET parse_ok=@ok, prompt_tokens=@p, cache_hit_tokens=@h, completion_tokens=@c, latency_ms=@lat WHERE request_id=@id",
             ("@ok", parsed.HasOps || parsed.IsNone ? 1 : 0),
             ("@p", result.Usage.PromptTokens),
             ("@h", result.Usage.CacheHitTokens),
             ("@c", result.Usage.CompletionTokens),
+            ("@lat", result.LatencyMs),
             ("@id", requestId));
 
         if (!parsed.HasOps && !parsed.IsNone)
@@ -1304,6 +1525,13 @@ public sealed class ChatRuntime : IAsyncDisposable
     private static string Mask(string chatId) =>
         chatId.Length <= 10 ? chatId : chatId[..6] + "…" + chatId[^4..];
 
+    /// <summary>空档案（只有 open_id 映射、没有名字/性格/评价/记忆）没有注入价值。</summary>
+    private static bool HasProfile(PersonRow person) =>
+        !string.IsNullOrWhiteSpace(person.Name)
+        || !string.IsNullOrWhiteSpace(person.Personality)
+        || !string.IsNullOrWhiteSpace(person.Evaluation)
+        || !string.IsNullOrWhiteSpace(person.MemoryText);
+
     public async ValueTask DisposeAsync()
     {
         await StopAsync().ConfigureAwait(false);
@@ -1323,6 +1551,9 @@ public sealed class ChatRuntime : IAsyncDisposable
         public ChatKind Kind { get; set; } = ChatKind.Group;
 
         public string? DisplayName { get; set; }
+
+        /// <summary>平台事件推出来的接收模式：true=全量，false=仅 @，null=还没见过事件。</summary>
+        public bool? ReceivesAllGroupMessages { get; set; }
 
         public Session? Session { get; set; }
 
@@ -1369,12 +1600,15 @@ public sealed class ChatRuntime : IAsyncDisposable
 public sealed record ChatSnapshot(
     string ChatId,
     ChatKind Kind,
+    string? DisplayName,
     string? SessionId,
     SessionState State,
     int TurnCount,
     int PendingCount,
     DateTimeOffset? CooldownUntil,
-    string? PrefixHash);
+    string? PrefixHash,
+    DateTimeOffset? LastActivityAt,
+    bool? ReceivesAllGroupMessages);
 
 /// <summary>按当前 API Key / 地址缓存客户端，配置页改了 key 不必重启进程。</summary>
 public sealed class ModelProvider : IDisposable

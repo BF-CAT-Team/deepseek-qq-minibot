@@ -14,6 +14,8 @@ public static partial class Delivery
 {
     private static readonly Regex MentionPattern = new(@"^\s*[@＠]([^\s:：,，]{1,12})[\s:：,，]?", RegexOptions.Compiled);
 
+    private static readonly char[] SentenceEnds = { '。', '！', '？', '!', '?', '；', ';', '…', '\n' };
+
     public static ReplyPlan Plan(string reply, EffectiveConfig cfg)
     {
         // 先清掉"回复："与 markdown 之类的前缀，再解析 @ —— 顺序反了就会漏掉 @。
@@ -27,6 +29,13 @@ public static partial class Delivery
             text = text[match.Length..].TrimStart();
         }
 
+        // reply_length 是硬上限：提示词只能降低概率，不能保证模型不超长。
+        // 这里在切气泡之前截断，保证发出去的总字数不超。
+        if (cfg.ReplyLength > 0 && text.Length > cfg.ReplyLength)
+        {
+            text = TruncateToLength(text, cfg.ReplyLength);
+        }
+
         if (text.Length == 0)
         {
             return new ReplyPlan(Array.Empty<string>(), mention);
@@ -37,6 +46,25 @@ public static partial class Delivery
             : new[] { text };
 
         return new ReplyPlan(bubbles.Where(b => b.Length > 0).ToArray(), mention);
+    }
+
+    /// <summary>超长回复截断：优先在句子边界收尾，实在没有才硬切并补省略号。</summary>
+    internal static string TruncateToLength(string text, int limit)
+    {
+        if (limit <= 0 || text.Length <= limit)
+        {
+            return text;
+        }
+
+        var head = text[..limit];
+        var cut = head.LastIndexOfAny(SentenceEnds);
+        if (cut >= 0 && cut + 1 >= limit * 6 / 10)
+        {
+            return head[..(cut + 1)].TrimEnd();
+        }
+
+        var keep = Math.Max(0, limit - 1);
+        return head[..keep].TrimEnd() + "…";
     }
 
     public static string StripFormatting(string text)

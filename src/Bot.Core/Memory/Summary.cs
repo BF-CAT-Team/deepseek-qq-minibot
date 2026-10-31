@@ -371,8 +371,13 @@ public sealed class SummaryApplier
 
         if (selfClaim)
         {
-            _identity.ApplyName(person.PersonId, name, "self");
-            return true;
+            var result = _identity.TryApplyName(person.PersonId, name, "self");
+            if (!result.Ok)
+            {
+                warnings.Add($"NAME 被拒（{name}）：{result.Message}");
+            }
+
+            return result.Ok;
         }
 
         return _identity.RecordNameEvidence(person.OpenId, chatId, name);

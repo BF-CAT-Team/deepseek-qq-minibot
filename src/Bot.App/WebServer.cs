@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Bot.Core.Abstractions;
 using Bot.Core.Config;
 using Bot.Core.Domain;
 using Bot.Core.Memory;
@@ -55,10 +56,19 @@ public sealed class WebServer : IAsyncDisposable
         app.MapPost("/api/test", TestConnection);
         app.MapGet("/api/persons", () => Results.Json(ListPersons(), Json));
         app.MapGet("/api/events", (string? q) => Results.Json(ListEvents(q), Json));
+        app.MapGet("/api/session", GetSession);
+        app.MapGet("/api/prompt-framework", () => Results.Json(_host.Framework.Build(), Json));
         app.MapPost("/api/simulate", Simulate);
         app.MapPost("/api/rotate", Rotate);
         app.MapPost("/api/memory/forget", Forget);
         app.MapPost("/api/memory/rollback", Rollback);
+        app.MapGet("/api/stickers", () => Results.Json(ListStickers(), Json));
+        app.MapPost("/api/stickers", SaveSticker);
+        app.MapPost("/api/stickers/test", TestStickers);
+        app.MapGet("/api/stickers/log", (int? limit) => Results.Json(RecentStickerLog(limit ?? 50), Json));
+        app.MapPost("/api/stickers/{id:int}/enabled", SetStickerEnabled);
+        app.MapDelete("/api/stickers/{id:int}", DeleteSticker);
+        app.MapGet("/api/stickers/{id:int}/image", GetStickerImage);
 
         _app = app;
         await app.StartAsync().ConfigureAwait(false);
@@ -82,29 +92,107 @@ public sealed class WebServer : IAsyncDisposable
         var db = _host.Db;
         var since = new DateTimeOffset(DateTime.Today).ToUnixTimeSeconds();
         var cost = new RequestLogStore(db).Summarize(null, since);
+        var adapterStatus = DescribeAdapter();
 
         return new
         {
             adapter = _host.AdapterName,
-            connected = true,
+            connected = adapterStatus.Online,
+            adapterStatus,
+            qq = new
+            {
+                configured = string.Equals(_host.Settings.Qq.Adapter, "qq", StringComparison.OrdinalIgnoreCase),
+                appIdSet = !string.IsNullOrWhiteSpace(_host.Settings.Qq.AppId),
+                secretSet = !string.IsNullOrWhiteSpace(_host.Settings.Qq.Secret),
+                runningAdapter = _host.AdapterName,
+            },
             persons = db.ScalarLong("SELECT COUNT(*) FROM person WHERE status='active'"),
             events = db.ScalarLong("SELECT COUNT(*) FROM event WHERE status='active'"),
             archived = db.ScalarLong("SELECT COUNT(*) FROM event WHERE status='archived'"),
+            stickers = db.ScalarLong("SELECT COUNT(*) FROM sticker WHERE enabled=1"),
             todayTokens = cost.PromptTokens + cost.CompletionTokens,
             todayRequests = cost.Requests,
             cacheHitRatio = Math.Round(cost.PrefixHitRatio, 4),
             walPending = _host.Wal.Count(),
-            chats = _host.Runtime.Snapshot().Select(c => new
-            {
-                chatId = c.ChatId,
-                state = c.State.ToString(),
-                turnCount = c.TurnCount,
-                pendingCount = c.PendingCount,
-                prefixHash = c.PrefixHash ?? string.Empty,
-            }),
+            chats = _host.Runtime.Snapshot().Select(c => DescribeChat(c)),
             warnings = _host.Config.Warnings,
             dataDirectory = AppPaths.Root,
         };
+    }
+
+    /// <summary>
+    /// 把适配器的真实状态翻译成页面能直接显示的内容。
+    /// <para>配置里选的和进程里跑的可能不是同一个（切换适配器要重启），这里必须说清楚，
+    /// 否则用户会以为"选了 QQ 就是在收 QQ 消息"。</para>
+    /// </summary>
+    /// <summary>
+    /// 会话列表的一行。
+    /// <para>
+    /// 会话因空闲/轮次/超时关闭后，运行时会把内存里的 <c>Session</c> 释放掉（<c>sessionId</c> 变成 null），
+    /// 但库里的记录还在。这里补一个轻量索引，让"空闲"的聊天仍然显示上一次的轮次/前缀哈希，
+    /// 并且能点回去看当时的 API 对话。
+    /// </para>
+    /// </summary>
+    private object DescribeChat(ChatSnapshot chat)
+    {
+        var live = !string.IsNullOrEmpty(chat.SessionId);
+        var last = live ? null : _host.Inspector.FindLatestBrief(chat.ChatId);
+
+        DateTimeOffset? lastActivity = chat.LastActivityAt;
+        if (last is not null)
+        {
+            lastActivity ??= DateTimeOffset.FromUnixTimeSeconds(last.LastAt);
+        }
+
+        return new
+        {
+            chatId = chat.ChatId,
+            displayName = chat.DisplayName,
+            kind = chat.Kind.ToString().ToLowerInvariant(),
+            sessionId = chat.SessionId,
+            lastSessionId = last?.SessionId,
+            state = chat.State.ToString(),
+            receivesAll = chat.ReceivesAllGroupMessages,
+            turnCount = live ? chat.TurnCount : (last?.TurnCount ?? 0),
+            pendingCount = chat.PendingCount,
+            prefixHash = live ? (chat.PrefixHash ?? string.Empty) : (last?.PrefixHash ?? string.Empty),
+            lastActivityAt = lastActivity,
+        };
+    }
+
+    private AdapterStatus DescribeAdapter()
+    {
+        var qq = _host.Settings.Qq;
+        var wantsQq = string.Equals(qq.Adapter, "qq", StringComparison.OrdinalIgnoreCase);
+        var runningQq = string.Equals(_host.AdapterName, "qq", StringComparison.OrdinalIgnoreCase);
+        var status = _host.Adapter.Status;
+
+        if (wantsQq && !runningQq)
+        {
+            var missing = string.IsNullOrWhiteSpace(qq.AppId) || string.IsNullOrWhiteSpace(qq.Secret);
+            return status with
+            {
+                Online = false,
+                State = "error",
+                Summary = missing
+                    ? "配置为 QQ 官方机器人，但 AppID / AppSecret 未填齐，本次已回退为 Mock"
+                    : "配置为 QQ，但当前进程仍运行 Mock（切换适配器后需要重启程序）",
+                Detail = "当前生效的适配器：" + _host.AdapterName,
+            };
+        }
+
+        if (!wantsQq && runningQq)
+        {
+            return status with
+            {
+                Online = false,
+                State = "pending-restart",
+                Summary = "配置已改为 Mock，但当前进程仍连着 QQ 网关（重启后生效）",
+                Detail = "当前生效的适配器：qq",
+            };
+        }
+
+        return status;
     }
 
     private JsonNode BuildConfig()
@@ -116,6 +204,15 @@ public sealed class WebServer : IAsyncDisposable
             var hasKey = !string.IsNullOrWhiteSpace(llm["apiKey"]?.GetValue<string>());
             llm["apiKey"] = string.Empty;
             llm["apiKeySet"] = hasKey;
+        }
+
+        // AppSecret 同样不回显：页面只需要知道"填过没有"，保存时留空 = 不修改。
+        var qq = node["qq"]?.AsObject();
+        if (qq is not null)
+        {
+            var hasSecret = !string.IsNullOrWhiteSpace(qq["secret"]?.GetValue<string>());
+            qq["secret"] = string.Empty;
+            qq["secretSet"] = hasSecret;
         }
 
         return node;
@@ -328,6 +425,56 @@ public sealed class WebServer : IAsyncDisposable
         }).ToArray();
     }
 
+    /// <summary>
+    /// 会话的 API 侧视图：点开"当前会话"时看的就是它。
+    /// 支持 <c>sessionId</c>（精确）与 <c>chatId</c>（该聊天最近的会话），两者都给时以 sessionId 为准。
+    /// </summary>
+    private IResult GetSession(string? chatId, string? sessionId)
+    {
+        try
+        {
+            SessionView? view;
+            if (!string.IsNullOrWhiteSpace(sessionId))
+            {
+                view = _host.Inspector.Get(sessionId.Trim());
+            }
+            else if (!string.IsNullOrWhiteSpace(chatId))
+            {
+                view = _host.Inspector.FindLatest(chatId.Trim());
+            }
+            else
+            {
+                return Results.BadRequest(new { error = "缺少 chatId 或 sessionId" });
+            }
+
+            if (view is null)
+            {
+                return Results.NotFound(new { error = "没有找到这个会话（可能还没有开过会话）" });
+            }
+
+            var live = _host.Runtime.Snapshot().FirstOrDefault(c => c.ChatId == view.ChatId);
+            if (live is not null)
+            {
+                view = view with
+                {
+                    ChatName = string.IsNullOrWhiteSpace(view.ChatName) ? live.DisplayName : view.ChatName,
+                    Kind = live.Kind.ToString().ToLowerInvariant(),
+                    // 只有当前内存里的会话就是它时，才把运行时状态贴上去；
+                    // 否则看历史会话会误显示成"进行中"。
+                    LiveState = string.Equals(live.SessionId, view.SessionId, StringComparison.Ordinal)
+                        ? live.State.ToString().ToLowerInvariant()
+                        : null,
+                };
+            }
+
+            return Results.Json(view, Json);
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
     private async Task<IResult> Simulate(HttpRequest request)
     {
         var mock = _host.MockAdapter;
@@ -358,24 +505,60 @@ public sealed class WebServer : IAsyncDisposable
             ChatDisplayName = "本地测试群",
         }).ConfigureAwait(false);
 
-        // 等运行时走完防抖 + 打字延迟，最多 9 秒。
-        for (var i = 0; i < 45; i++)
+        // 等运行时走完防抖 + 打字延迟 + 表情包（表情包在正文之后才发），
+        // 以「一段时间没有新消息」作为结束条件，最多 12 秒。
+        var deadline = DateTime.UtcNow.AddSeconds(12);
+        var lastCount = before;
+        var stableSince = DateTime.UtcNow;
+        while (DateTime.UtcNow < deadline)
         {
-            await Task.Delay(200).ConfigureAwait(false);
-            if (mock.Sent.Count > before)
+            await Task.Delay(150).ConfigureAwait(false);
+            var count = mock.Sent.Count;
+            if (count != lastCount)
+            {
+                lastCount = count;
+                stableSince = DateTime.UtcNow;
+                continue;
+            }
+
+            if (count > before && DateTime.UtcNow - stableSince >= TimeSpan.FromMilliseconds(1500))
             {
                 break;
             }
         }
 
-        var replies = mock.Sent.Skip(before)
-            .Select(m => new { label = _host.Settings.Persona.BotName, content = m.Content })
-            .ToArray();
+        var botName = _host.Settings.Persona.BotName;
+        var replies = new List<object>();
+        foreach (var sent in mock.Sent.Skip(before))
+        {
+            if (sent.Sticker is { } sticker)
+            {
+                replies.Add(new
+                {
+                    kind = "sticker",
+                    label = botName,
+                    content = string.Empty,
+                    stickerId = sticker.StickerId,
+                    imageUrl = $"/api/stickers/{sticker.StickerId}/image",
+                });
+            }
+            else
+            {
+                replies.Add(new
+                {
+                    kind = "text",
+                    label = botName,
+                    content = sent.Content,
+                    stickerId = 0,
+                    imageUrl = string.Empty,
+                });
+            }
+        }
 
         return Results.Json(new
         {
             replies,
-            reason = replies.Length > 0 ? null : "本轮没有触发回复（未 @ 且未命中关键词/疑问句，或处于冷却中）",
+            reason = replies.Count > 0 ? null : "本轮没有触发回复（未 @ 且未命中关键词/疑问句，或处于冷却中）",
         }, Json);
     }
 
@@ -416,6 +599,186 @@ public sealed class WebServer : IAsyncDisposable
 
         var reverted = _host.OpLog.Revert(batchId);
         return Results.Json(new { ok = true, reverted }, Json);
+    }
+
+    // ------------------------------------------------------------------ 表情包
+
+    private object ListStickers() => _host.Stickers.List().Select(row => new
+    {
+        id = row.StickerId,
+        keywords = row.Keywords,
+        enabled = row.Enabled,
+        useCount = row.SendCount,
+        lastSentAt = row.LastSentAt,
+        originalName = row.OriginalName,
+        createdAt = row.CreatedAt,
+        updatedAt = row.UpdatedAt,
+        imageUrl = $"/api/stickers/{row.StickerId}/image?v={row.UpdatedAt}",
+    }).ToArray();
+
+    private static object DescribeSticker(StickerRow row) => new
+    {
+        id = row.StickerId,
+        keywords = row.Keywords,
+        enabled = row.Enabled,
+        useCount = row.SendCount,
+        lastSentAt = row.LastSentAt,
+        originalName = row.OriginalName,
+        updatedAt = row.UpdatedAt,
+        imageUrl = $"/api/stickers/{row.StickerId}/image?v={row.UpdatedAt}",
+    };
+
+    private async Task<IResult> SaveSticker(HttpRequest request)
+    {
+        try
+        {
+            var body = await JsonSerializer.DeserializeAsync<JsonObject>(request.Body, Json).ConfigureAwait(false)
+                       ?? new JsonObject();
+
+            var id = JsonInt(body, "id", 0);
+            var keywords = JsonString(body, "keywords");
+            var enabled = JsonBool(body, "enabled", true);
+            var image = DecodeImage(JsonString(body, "dataUrl"));
+            var originalName = JsonString(body, "fileName");
+            var input = new StickerInput(keywords, enabled, image,
+                string.IsNullOrWhiteSpace(originalName) ? null : originalName);
+
+            var row = id > 0 ? _host.Stickers.Update(id, input) : _host.Stickers.Create(input);
+            return Results.Json(new { ok = true, sticker = DescribeSticker(row) }, Json);
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
+    private async Task<IResult> SetStickerEnabled(int id, HttpRequest request)
+    {
+        var body = await JsonSerializer.DeserializeAsync<JsonObject>(request.Body, Json).ConfigureAwait(false);
+        var enabled = JsonBool(body, "enabled", true);
+        return _host.Stickers.SetEnabled(id, enabled)
+            ? Results.Json(new { ok = true }, Json)
+            : Results.NotFound(new { error = "表情包不存在" });
+    }
+
+    private IResult DeleteSticker(int id) =>
+        _host.Stickers.Delete(id)
+            ? Results.Json(new { ok = true }, Json)
+            : Results.NotFound(new { error = "表情包不存在" });
+
+    private IResult GetStickerImage(int id)
+    {
+        var image = _host.Stickers.ReadImage(id);
+        if (image is null)
+        {
+            return Results.NotFound(new { error = "图片不存在（文件可能已被删除）" });
+        }
+
+        return Results.File(image.Value.Bytes, image.Value.ContentType);
+    }
+
+    /// <summary>只算不发：拿一段文本试算每张图的得分，方便调关键词和阈值。</summary>
+    private async Task<IResult> TestStickers(HttpRequest request)
+    {
+        var body = await JsonSerializer.DeserializeAsync<JsonObject>(request.Body, Json).ConfigureAwait(false);
+        var text = JsonString(body, "text");
+        var cfg = _host.Config.ForChat(string.Empty);
+        var scores = StickerMatch.Score(text, _host.Stickers.List(), cfg.StickerMinWeight);
+        var best = StickerMatch.Best(scores);
+
+        return Results.Json(new
+        {
+            enabled = cfg.StickerEnabled,
+            probability = cfg.StickerProbability,
+            threshold = cfg.StickerMinWeight,
+            bestId = best?.Sticker.StickerId,
+            bestScore = best?.Score,
+            scores = scores.OrderByDescending(score => score.Score).Select(score => new
+            {
+                id = score.Sticker.StickerId,
+                keywords = score.Sticker.Keywords,
+                enabled = score.Sticker.Enabled,
+                useCount = score.Sticker.SendCount,
+                score = score.Score,
+                threshold = score.Threshold,
+                meets = score.MeetsThreshold,
+                hitText = score.HitText,
+                hits = score.Hits.Select(hit => new { word = hit.Word, weight = hit.Weight, count = hit.Count }),
+                imageUrl = $"/api/stickers/{score.Sticker.StickerId}/image?v={score.Sticker.UpdatedAt}",
+            }),
+        }, Json);
+    }
+
+    private object RecentStickerLog(int limit) => _host.Stickers.RecentLog(limit).Select(row => new
+    {
+        id = row.Id,
+        chatId = row.ChatId,
+        stickerId = row.StickerId,
+        keywords = row.Keywords,
+        score = row.Score,
+        threshold = row.Threshold,
+        probability = row.Probability,
+        roll = row.Roll,
+        result = row.Result,
+        mode = row.Mode,
+        replyExcerpt = row.ReplyExcerpt,
+        createdAt = row.CreatedAt,
+    }).ToArray();
+
+    private static string JsonString(JsonObject? body, string name)
+    {
+        var node = body?[name];
+        return node is JsonValue value && value.TryGetValue<string>(out var text) ? text ?? string.Empty : string.Empty;
+    }
+
+    private static int JsonInt(JsonObject? body, string name, int fallback)
+    {
+        var node = body?[name];
+        if (node is JsonValue value)
+        {
+            if (value.TryGetValue<int>(out var number))
+            {
+                return number;
+            }
+
+            if (value.TryGetValue<double>(out var real))
+            {
+                return (int)Math.Round(real);
+            }
+        }
+
+        return fallback;
+    }
+
+    private static bool JsonBool(JsonObject? body, string name, bool fallback)
+    {
+        var node = body?[name];
+        return node is JsonValue value && value.TryGetValue<bool>(out var flag) ? flag : fallback;
+    }
+
+    /// <summary>浏览器传的是 data URL（data:image/png;base64,…）；也接受裸 base64。</summary>
+    private static byte[]? DecodeImage(string? dataUrl)
+    {
+        if (string.IsNullOrWhiteSpace(dataUrl))
+        {
+            return null;
+        }
+
+        var text = dataUrl.Trim();
+        var comma = text.IndexOf(',');
+        if (text.StartsWith("data:", StringComparison.OrdinalIgnoreCase) && comma > 0)
+        {
+            text = text[(comma + 1)..];
+        }
+
+        try
+        {
+            return Convert.FromBase64String(text);
+        }
+        catch (FormatException)
+        {
+            throw new ArgumentException("图片数据不是有效的 base64");
+        }
     }
 
     public async ValueTask DisposeAsync() => await StopAsync().ConfigureAwait(false);

@@ -33,6 +33,7 @@ public static class ParamRegistry
     public const string CatTrigger = "触发与会话";
     public const string CatMemory = "记忆";
     public const string CatDialogue = "对话与输出";
+    public const string CatSticker = "表情包";
     public const string CatOps = "运维";
     public const string CatRuntime = "运行时";
 
@@ -97,11 +98,27 @@ public static class ParamRegistry
         new("thinking", ParamType.String, CatDialogue, "思考模式：disabled=关闭（省钱、响应快）", JsonValue.Create("disabled"),
             Choices: new[] { "disabled", "enabled", "auto" }, BreaksCache: true),
         new("temperature", ParamType.Double, CatDialogue, "采样温度", JsonValue.Create(0.9), 0, 1.5),
-        new("reply_length", ParamType.String, CatDialogue, "回复长度倾向", JsonValue.Create("简短"), Choices: new[] { "极简", "简短", "标准" }),
+        new("reply_length", ParamType.Int, CatDialogue, "回复的最大字符数（写进规则与尾部提示，发送前硬截断）", JsonValue.Create(40), 10, 500, BreaksCache: true),
         new("split_bubbles", ParamType.Bool, CatDialogue, "把一条回复切成 1–3 条气泡", JsonValue.Create(true)),
         new("typing_jitter", ParamType.Bool, CatDialogue, "首条气泡前的拟人延迟抖动", JsonValue.Create(true)),
         new("history_keep_tokens", ParamType.Int, CatDialogue, "历史区保留 token 目标", JsonValue.Create(2400), 600, 8000, BreaksCache: true),
         new("summary_model", ParamType.String, CatDialogue, "总结用的模型；空=同 model", JsonValue.Create("")),
+
+        // ---------------- 表情包 ----------------
+        // 关键词、触发最低权重是每张图各自的（存在 sticker 表里）；这里只有全局旋钮。
+        new("sticker_enabled", ParamType.Bool, CatSticker,
+            "总开关：回复发出后按关键词匹配图片库并追加一张表情包（表情包不进入对话历史）",
+            JsonValue.Create(true)),
+        new("sticker_probability", ParamType.Double, CatSticker,
+            "选出一张表情包后真正发送的概率（全局；每张图不再单独设概率）", JsonValue.Create(0.3), 0, 1),
+        new("sticker_min_weight", ParamType.Double, CatSticker,
+            "触发最低权重（全局）：回复命中关键词的得分达到这个值才进入候选；每张图不再单独设阈值",
+            JsonValue.Create(2d), 0.1, 100),
+        new("sticker_cooldown_sec", ParamType.Int, CatSticker,
+            "同一个聊天两次表情包之间的最小间隔（秒）；0=不限", JsonValue.Create(45), 0, 3600),
+        new("sticker_active_when_no_msg", ParamType.Bool, CatSticker,
+            "全量模式下这一轮没有可被动回复的 msg_id（主动接话 / 消息超过 5 分钟）时，是否允许按主动消息发送；关掉=这种场景不发",
+            JsonValue.Create(true)),
 
         // ---------------- 运维 ----------------
         new("archive_job_time", ParamType.TimeOfDay, CatOps, "每日归档扫描时刻 HH:mm", JsonValue.Create("04:00")),
@@ -312,7 +329,7 @@ public static class Presets
             ["event_score_threshold"] = 0.55,
             ["person_memory_limit"] = 80,
             ["history_keep_tokens"] = 1200,
-            ["reply_length"] = "极简",
+            ["reply_length"] = 20,
         },
         Experience => new JsonObject
         {
@@ -326,7 +343,7 @@ public static class Presets
             ["event_score_threshold"] = 0.2,
             ["person_memory_limit"] = 160,
             ["history_keep_tokens"] = 4000,
-            ["reply_length"] = "标准",
+            ["reply_length"] = 80,
         },
         _ => new JsonObject
         {
@@ -340,7 +357,7 @@ public static class Presets
             ["event_score_threshold"] = 0.35,
             ["person_memory_limit"] = 100,
             ["history_keep_tokens"] = 2400,
-            ["reply_length"] = "简短",
+            ["reply_length"] = 40,
         },
     };
 }

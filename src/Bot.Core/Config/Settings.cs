@@ -70,12 +70,6 @@ public sealed class QqSettings
     /// <summary>沙箱环境网关。</summary>
     public bool Sandbox { get; set; }
 
-    /// <summary>
-    /// 群主/管理员已在群设置里开启「允许机器人接收群内所有消息」。
-    /// 打开后适配器才敢声明"能旁听全群"，关键词触发与话题漂移才有意义。
-    /// </summary>
-    public bool ReceivesAllMessages { get; set; }
-
     /// <summary>额外的订阅事件位（一般留 0）。</summary>
     public int ExtraIntents { get; set; }
 }
@@ -133,12 +127,32 @@ public static class SettingsStore
                 return new AppSettings();
             }
 
+            // reply_length 从"极简/简短/标准"改成数值：旧配置不迁移的话会落回默认值 + 一条告警。
+            MigrateLegacyReplyLength(settings.Parameters);
+            foreach (var chat in settings.Chats.Values)
+            {
+                MigrateLegacyReplyLength(chat.Parameters);
+            }
+
             return settings;
         }
         catch (Exception ex)
         {
             error = $"读取设置失败，已使用默认设置：{ex.Message}";
             return new AppSettings();
+        }
+    }
+
+    private static void MigrateLegacyReplyLength(JsonObject? parameters)
+    {
+        if (parameters?["reply_length"] is JsonValue value && value.TryGetValue<string>(out var legacy))
+        {
+            parameters["reply_length"] = legacy switch
+            {
+                "极简" => 20,
+                "标准" => 80,
+                _ => 40,
+            };
         }
     }
 
@@ -291,7 +305,8 @@ public sealed class EffectiveConfig
 
     public double Temperature => Params.GetDouble("temperature");
 
-    public string ReplyLength => Params.GetString("reply_length");
+    /// <summary>回复的最大字符数：既写进动态尾部提示模型，也在投递前做硬截断。</summary>
+    public int ReplyLength => Params.GetInt("reply_length");
 
     public bool SplitBubbles => Params.GetBool("split_bubbles");
 
@@ -300,6 +315,25 @@ public sealed class EffectiveConfig
     public int HistoryKeepTokens => Params.GetInt("history_keep_tokens");
 
     public string SummaryModel => Params.GetString("summary_model");
+
+    // ---- 表情包 ----
+    /// <summary>回复发出后是否追加表情包（表情包不进入对话历史，也不改 prompt）。</summary>
+    public bool StickerEnabled => Params.GetBool("sticker_enabled");
+
+    /// <summary>选出得分最高的表情包后，真正发送的概率（全局）。</summary>
+    public double StickerProbability => Params.GetDouble("sticker_probability");
+
+    /// <summary>触发最低权重（全局）：所有图片共用这一个阈值。</summary>
+    public double StickerMinWeight => Params.GetDouble("sticker_min_weight");
+
+    /// <summary>同一个聊天两次表情包之间的最小间隔（秒）；0=不限。</summary>
+    public int StickerCooldownSec => Params.GetInt("sticker_cooldown_sec");
+
+    /// <summary>
+    /// 这一轮没有可被动回复的 msg_id 时（全量模式下的主动接话，或消息已超过 5 分钟），
+    /// 是否允许按主动消息发送表情包。关掉=这种场景宁可少发，也不占主动消息频控。
+    /// </summary>
+    public bool StickerActiveWhenNoMsg => Params.GetBool("sticker_active_when_no_msg");
 
     // ---- 运维 ----
     public TimeOnly ArchiveJobTime => Params.GetTimeOfDay("archive_job_time");

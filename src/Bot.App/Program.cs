@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Windows.Forms;
+using Bot.Core;
+using Bot.Core.Memory;
 
 namespace Bot.App;
 
@@ -10,6 +12,14 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // 运维：清空全部事件记忆（先备份 data\bot.db*），不启动机器人。
+        if (args.Any(a => string.Equals(a, "--clear-events", StringComparison.OrdinalIgnoreCase)
+                          || string.Equals(a, "/clear-events", StringComparison.OrdinalIgnoreCase)))
+        {
+            ClearEvents();
+            return;
+        }
+
         // 生成《设置说明》后直接退出，不启动机器人。
         var dumpIndex = Array.FindIndex(args, a => string.Equals(a, "--dump-params", StringComparison.OrdinalIgnoreCase));
         if (dumpIndex >= 0)
@@ -81,6 +91,45 @@ internal static class Program
         catch
         {
             // 退出路径不再打扰用户
+        }
+    }
+
+    /// <summary>一次性清空事件记忆：先备份 data\bot.db*，再 DELETE event 并重建 FTS。</summary>
+    private static void ClearEvents()
+    {
+        var trace = Path.Combine(AppContext.BaseDirectory, "clear-events.log");
+        try
+        {
+            File.AppendAllText(trace, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} start root={AppPaths.Root} db={AppPaths.DbFile}{Environment.NewLine}");
+            Directory.CreateDirectory(AppPaths.Root);
+
+            var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            var backupDir = Path.Combine(AppPaths.Root, "backup-before-clear-" + stamp);
+            Directory.CreateDirectory(backupDir);
+            foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+            {
+                var source = AppPaths.DbFile + suffix;
+                if (File.Exists(source))
+                {
+                    File.Copy(source, Path.Combine(backupDir, Path.GetFileName(source)));
+                }
+            }
+
+            using var db = new Db(AppPaths.DbFile);
+            db.Initialize();
+
+            var cleared = new EventStore(db, SystemClock.Instance, new MemoryOpLog(db)).ClearAll();
+
+            // 启动恢复会把 summary_raw 重放成事件；不删掉的话，下次启动旧事件会回来。
+            db.Exec("DELETE FROM wal_pending WHERE kind='summary_raw'");
+
+            File.AppendAllText(trace, $"cleared={cleared} backup={backupDir}{Environment.NewLine}");
+            Console.WriteLine($"已清空 {cleared} 条事件记忆；备份目录：{backupDir}");
+        }
+        catch (Exception ex)
+        {
+            File.AppendAllText(trace, "ERROR " + ex + Environment.NewLine);
+            Console.Error.WriteLine(ex);
         }
     }
 }

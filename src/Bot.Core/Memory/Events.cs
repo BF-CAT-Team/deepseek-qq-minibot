@@ -170,6 +170,18 @@ public sealed class EventStore
         }
     }
 
+    /// <summary>
+    /// 清空全部事件记忆（active + archived），级联删除 event_person / event_keyword 并重建 FTS。
+    /// 不可撤销，只给明确要求"清空事件记忆"的运维操作使用；事件 ID 不复位。
+    /// </summary>
+    public int ClearAll()
+    {
+        var count = (int)_db.ScalarLong("SELECT COUNT(*) FROM event");
+        _db.Exec("DELETE FROM event");
+        _db.Exec("INSERT INTO event_fts(event_fts) VALUES('rebuild')");
+        return count;
+    }
+
     /// <summary>归档而非删除：超 ttl 未被注入、非置顶、importance ≤ 3 → archived。</summary>
     public int ArchiveStale(int ttlDays)
     {
@@ -366,10 +378,14 @@ public sealed class RetrievalService
         }
 
         var selected = new List<RetrievedEvent>();
+        var maxEvents = Math.Max(0, cfg.EventTopK);
+
+        // 置顶也计入 event_topk：参数说明写的是"每次注入的事件条数上限"，
+        // 不能再额外加 pinned_max，否则默认配置实际能注入 5+3=8 条。
         foreach (var pinned in scored.Where(s => s.Event.Pinned)
                      .OrderByDescending(s => s.Score)
                      .ThenBy(s => s.Event.EventId)
-                     .Take(cfg.PinnedMax))
+                     .Take(Math.Min(cfg.PinnedMax, maxEvents)))
         {
             selected.Add(pinned);
         }
@@ -384,7 +400,7 @@ public sealed class RetrievalService
 
         foreach (var candidate in ApplyDiversity(ranked, cfg.DiversityLambda))
         {
-            if (selected.Count >= cfg.EventTopK + cfg.PinnedMax)
+            if (selected.Count >= maxEvents)
             {
                 break;
             }

@@ -8,6 +8,32 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Bot.QQ;
 
+/// <summary>网关连接状态。配置页据此显示"是否真的听得见"，而不是"进程还在"。</summary>
+public enum GatewayState
+{
+    Stopped = 0,
+    Connecting = 1,
+    Online = 2,
+    Reconnecting = 3,
+}
+
+/// <summary>网关状态快照（只读，供配置页轮询）。</summary>
+public sealed record GatewayStatus(
+    GatewayState State,
+    string? Url,
+    DateTimeOffset ChangedAt,
+    DateTimeOffset? LastInboundAt,
+    DateTimeOffset? LastEventAt,
+    long InboundCount,
+    int Reconnects,
+    string? LastError,
+    string? SessionId,
+    DateTimeOffset? LastHeartbeatAt)
+{
+    public static readonly GatewayStatus StoppedStatus =
+        new(GatewayState.Stopped, null, DateTimeOffset.UtcNow, null, null, 0, 0, null, null, null);
+}
+
 /// <summary>
 /// QQ 官方机器人 WebSocket 网关。
 /// <para>协议要点：op10 hello 给心跳间隔；op2 identify 带 <c>QQBot {token}</c>；op1 心跳带上次 seq；
@@ -29,6 +55,17 @@ public sealed class QqGateway : IAsyncDisposable
     private readonly ILogger<QqGateway> _log;
     private readonly ClientWebSocket _socket = new();
 
+    private readonly object _statusGate = new();
+    private GatewayState _state = GatewayState.Stopped;
+    private DateTimeOffset _stateSince = DateTimeOffset.UtcNow;
+    private DateTimeOffset? _lastInboundAt;
+    private DateTimeOffset? _lastEventAt;
+    private DateTimeOffset? _lastHeartbeatAt;
+    private long _inboundCount;
+    private int _reconnects;
+    private string? _lastError;
+    private string? _gatewayUrl;
+
     private int _lastSeq = -1;
     private string? _sessionId;
     private CancellationTokenSource? _heartbeatCts;
@@ -44,15 +81,41 @@ public sealed class QqGateway : IAsyncDisposable
 
     public event Action<string>? Fatal;
 
+    /// <summary>当前连接状态。无副作用，配置页可随时调用。</summary>
+    public GatewayStatus Snapshot()
+    {
+        lock (_statusGate)
+        {
+            return new GatewayStatus(
+                _state,
+                _gatewayUrl,
+                _stateSince,
+                _lastInboundAt,
+                _lastEventAt,
+                _inboundCount,
+                _reconnects,
+                _lastError,
+                _sessionId,
+                _lastHeartbeatAt);
+        }
+    }
+
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         var backoff = TimeSpan.FromSeconds(1);
+        var attempt = 0;
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
+                if (attempt == 0)
+                {
+                    SetState(GatewayState.Connecting, null);
+                }
+
                 await ConnectAndListenAsync(cancellationToken).ConfigureAwait(false);
                 backoff = TimeSpan.FromSeconds(1);
+                SetState(GatewayState.Reconnecting, "网关连接被关闭，准备重连");
             }
             catch (OperationCanceledException)
             {
@@ -62,6 +125,17 @@ public sealed class QqGateway : IAsyncDisposable
             {
                 _log.LogError(ex, "网关连接异常，{Backoff} 后重连", backoff);
                 Fatal?.Invoke(ex.Message);
+                SetState(GatewayState.Reconnecting, ex.Message);
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+
+            lock (_statusGate)
+            {
+                _reconnects++;
             }
 
             try
@@ -74,6 +148,65 @@ public sealed class QqGateway : IAsyncDisposable
             }
 
             backoff = TimeSpan.FromSeconds(Math.Min(30, backoff.TotalSeconds * 1.8));
+            attempt++;
+        }
+
+        SetState(GatewayState.Stopped, null);
+    }
+
+    private void SetState(GatewayState state, string? error)
+    {
+        lock (_statusGate)
+        {
+            if (_state != state)
+            {
+                _state = state;
+                _stateSince = DateTimeOffset.UtcNow;
+            }
+
+            _lastError = error;
+        }
+    }
+
+    private void MarkOnline(string? sessionId)
+    {
+        lock (_statusGate)
+        {
+            _state = GatewayState.Online;
+            _stateSince = DateTimeOffset.UtcNow;
+            _lastError = null;
+            if (!string.IsNullOrWhiteSpace(sessionId))
+            {
+                _sessionId = sessionId;
+            }
+        }
+    }
+
+    private void RecordEvent()
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (_statusGate)
+        {
+            _lastEventAt = now;
+        }
+    }
+
+    private void RecordInbound()
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (_statusGate)
+        {
+            _lastEventAt = now;
+            _lastInboundAt = now;
+            _inboundCount++;
+        }
+    }
+
+    private void RecordHeartbeatAck()
+    {
+        lock (_statusGate)
+        {
+            _lastHeartbeatAt = DateTimeOffset.UtcNow;
         }
     }
 
@@ -81,6 +214,11 @@ public sealed class QqGateway : IAsyncDisposable
     {
         var gatewayUrl = await _api.GetGatewayAsync(cancellationToken).ConfigureAwait(false);
         var token = await _api.GetTokenAsync(cancellationToken).ConfigureAwait(false);
+
+        lock (_statusGate)
+        {
+            _gatewayUrl = gatewayUrl;
+        }
 
         if (_socket.State is WebSocketState.Open or WebSocketState.Connecting)
         {
@@ -109,6 +247,7 @@ public sealed class QqGateway : IAsyncDisposable
         }
 
         _log.LogInformation("已连接 QQ 网关 {Url}", gatewayUrl);
+        SetState(GatewayState.Connecting, null);
 
         var buffer = new byte[16 * 1024];
         var assembly = new MemoryStream();
@@ -171,15 +310,19 @@ public sealed class QqGateway : IAsyncDisposable
 
             case OpDispatch:
             {
+                // 任何 dispatch 都说明 socket 还活着；消息事件再单独记 last inbound。
+                RecordEvent();
                 var type = root.TryGetProperty("t", out var tElement) ? tElement.GetString() : null;
                 if (string.Equals(type, "READY", StringComparison.Ordinal))
                 {
+                    string? readySession = null;
                     if (root.TryGetProperty("d", out var ready) && ready.TryGetProperty("session_id", out var sid))
                     {
-                        _sessionId = sid.GetString();
-                        _log.LogInformation("网关就绪，session={Session}", _sessionId);
+                        readySession = sid.GetString();
+                        _log.LogInformation("网关就绪，session={Session}", readySession);
                     }
 
+                    MarkOnline(readySession);
                     return true;
                 }
 
@@ -202,9 +345,21 @@ public sealed class QqGateway : IAsyncDisposable
                             _log.LogInformation("收到无文本消息（图片/语音/卡片/聊天记录），已忽略，不进入对话");
                         }
                     }
-                    else if (MessageReceived is not null)
+                    else
                     {
-                        await MessageReceived(message).ConfigureAwait(false);
+                        RecordInbound();
+                        if (MessageReceived is not null)
+                        {
+                            try
+                            {
+                                await MessageReceived(message).ConfigureAwait(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                // 一条消息处理失败不能让整个网关断开：断线意味着接下来所有消息都收不到。
+                                _log.LogError(ex, "消息处理异常（网关继续运行）");
+                            }
+                        }
                     }
                 }
 
@@ -212,6 +367,7 @@ public sealed class QqGateway : IAsyncDisposable
             }
 
             case OpHeartbeatAck:
+                RecordHeartbeatAck();
                 return true;
 
             case OpReconnect:
@@ -220,7 +376,11 @@ public sealed class QqGateway : IAsyncDisposable
 
             case OpInvalidSession:
                 _log.LogWarning("会话失效，下次连接重新 identify");
-                _sessionId = null;
+                lock (_statusGate)
+                {
+                    _sessionId = null;
+                }
+
                 _lastSeq = -1;
                 return false;
 
@@ -297,6 +457,7 @@ public sealed class QqGateway : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        SetState(GatewayState.Stopped, null);
         _heartbeatCts?.Cancel();
         _heartbeatCts?.Dispose();
         if (_socket.State == WebSocketState.Open)

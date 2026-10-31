@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Bot.Core.Config;
 using Bot.Core.Domain;
 
@@ -25,6 +26,11 @@ public sealed class TriggerEngine
     private const int AnswerWindowSeconds = 10;
     private const int QuestionWaitSeconds = 30;
     private const int BotSilenceThreshold = 3;
+
+    /// <summary>平台/适配器塞进正文的占位符，不代表任何可读内容。</summary>
+    private static readonly Regex PlaceholderPattern = new(
+        @"\[(?:表情|图片|语音|视频|动画表情|文件|链接|位置|名片|红包|转账|音乐|小程序|聊天记录)\]",
+        RegexOptions.Compiled);
 
     private readonly Func<double> _roll;
 
@@ -213,7 +219,7 @@ public sealed class TriggerEngine
         return same >= 3;
     }
 
-    /// <summary>纯表情 / 纯标点 / 纯空白 → 不值得回应。</summary>
+    /// <summary>纯表情 / 纯标点 / 纯占位符（[表情]）→ 不值得回应，也不进对话。</summary>
     public static bool IsOnlyNoise(string? content)
     {
         if (string.IsNullOrWhiteSpace(content))
@@ -221,7 +227,9 @@ public sealed class TriggerEngine
             return true;
         }
 
-        foreach (var ch in content)
+        // 平台把表情转成 [表情]、图片转成 [图片]；这些占位符本身没有语义。
+        var meaningful = PlaceholderPattern.Replace(content, string.Empty);
+        foreach (var ch in meaningful)
         {
             if (char.IsLetterOrDigit(ch))
             {

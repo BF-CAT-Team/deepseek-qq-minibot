@@ -55,18 +55,20 @@ public sealed class RequestLogStore
             ("@err", row.ErrorCode));
     }
 
-    public void MarkConfirmed(string requestId, int completionTokens, int promptTokens, int cacheHit, int cacheMiss)
+    public void MarkConfirmed(string requestId, int completionTokens, int promptTokens, int cacheHit, int cacheMiss,
+        int latencyMs)
     {
         _db.Exec(
             """
             UPDATE request_log SET send_confirmed=1, completion_tokens=@c, prompt_tokens=@p,
-                   cache_hit_tokens=@hit, cache_miss_tokens=@miss
+                   cache_hit_tokens=@hit, cache_miss_tokens=@miss, latency_ms=@lat
             WHERE request_id=@id
             """,
             ("@c", completionTokens),
             ("@p", promptTokens),
             ("@hit", cacheHit),
             ("@miss", cacheMiss),
+            ("@lat", latencyMs),
             ("@id", requestId));
     }
 
@@ -91,6 +93,19 @@ public sealed class RequestLogStore
             """,
             MapRow,
             ("@c", chatId),
+            ("@n", limit));
+
+    /// <summary>某个会话的请求记录（配置页"查看 API 对话"里展示最近几次调用的用量）。</summary>
+    public IReadOnlyList<RequestLogRow> RecentBySession(string sessionId, int limit = 20) =>
+        _db.Query(
+            """
+            SELECT request_id, session_id, chat_id, seq, kind, model, sent_at, prefix_hash, prefix_tokens,
+                   history_tokens, tail_tokens, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
+                   completion_tokens, latency_ms, parse_ok, retry_of, idem_key, send_confirmed, error_code
+            FROM request_log WHERE session_id=@s ORDER BY sent_at DESC LIMIT @n
+            """,
+            MapRow,
+            ("@s", sessionId),
             ("@n", limit));
 
     public CostSummary Summarize(string? chatId, long sinceUnix)

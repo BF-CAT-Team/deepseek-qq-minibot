@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bot.Core.Config;
+using Bot.Core.Domain;
 
 namespace Bot.QQ;
 
@@ -57,7 +58,8 @@ public sealed class QqApi
     {
         _settings = settings;
         _trace = trace;
-        _http = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+        // 表情包走富媒体上传：base64 后的请求体可能有好几 MB，20s 偏紧。
+        _http = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
     }
 
     /// <summary>
@@ -169,6 +171,88 @@ public sealed class QqApi
 
         using var response = await SendAuthorizedAsync(HttpMethod.Post, $"/v2/users/{openId}/messages", payload, cancellationToken)
             .ConfigureAwait(false);
+        await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    // ------------------------------------------------------------------ 富媒体（表情包）
+
+    /// <summary>
+    /// 上传图片并拿回 <c>file_info</c>。QQ 的富媒体是两步：先上传，再用 <c>msg_type=7</c> 发出去。
+    /// <para>群和单聊的上传接口互相独立，传错端点会直接失败，所以 <paramref name="kind"/> 必须准确。</para>
+    /// </summary>
+    public async Task<string> UploadImageAsync(ChatKind kind, string openId, byte[] bytes, string fileName,
+        CancellationToken cancellationToken)
+    {
+        var path = MediaUploadPath(kind, openId);
+        var payload = BuildMediaUploadPayload(bytes, fileName);
+
+        using var response = await SendAuthorizedAsync(HttpMethod.Post, path, payload, cancellationToken)
+            .ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"QQ 图片上传失败：HTTP {(int)response.StatusCode} {body}");
+        }
+
+        using var document = JsonDocument.Parse(body);
+        if (!document.RootElement.TryGetProperty("file_info", out var info)
+            || string.IsNullOrWhiteSpace(info.GetString()))
+        {
+            throw new InvalidOperationException($"QQ 图片上传失败：响应里没有 file_info（{body}）");
+        }
+
+        _trace?.Invoke($"已上传表情包 {fileName}（{bytes.Length} 字节）");
+        return info.GetString()!;
+    }
+
+    public static string MediaUploadPath(ChatKind kind, string openId) =>
+        kind == ChatKind.Group
+            ? $"/v2/groups/{Uri.EscapeDataString(openId)}/files"
+            : $"/v2/users/{Uri.EscapeDataString(openId)}/files";
+
+    /// <summary>上传请求体：file_type=1（图片）+ base64 的 file_data；srv_send_msg=false 只换 file_info。</summary>
+    public static Dictionary<string, object?> BuildMediaUploadPayload(byte[] bytes, string fileName) => new()
+    {
+        ["file_type"] = 1,
+        ["file_name"] = string.IsNullOrWhiteSpace(fileName) ? "sticker.png" : fileName,
+        ["file_data"] = Convert.ToBase64String(bytes),
+        ["srv_send_msg"] = false,
+    };
+
+    /// <summary>
+    /// 发图请求体。<paramref name="msgId"/> 非空 = 被动回复（5 分钟内、不占主动频控）；
+    /// 为空 = 主动消息（全量模式下主动接话 / 消息超过 5 分钟时的唯一选择）。
+    /// </summary>
+    public static Dictionary<string, object?> BuildMediaMessagePayload(string fileInfo, string? msgId, int msgSeq)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["msg_type"] = 7,
+            ["media"] = new Dictionary<string, object?> { ["file_info"] = fileInfo },
+        };
+
+        if (!string.IsNullOrWhiteSpace(msgId))
+        {
+            payload["msg_id"] = msgId;
+            payload["msg_seq"] = msgSeq;
+        }
+
+        return payload;
+    }
+
+    public async Task SendGroupImageAsync(string groupOpenId, string fileInfo, string? msgId, int msgSeq,
+        CancellationToken cancellationToken)
+    {
+        using var response = await SendAuthorizedAsync(HttpMethod.Post, $"/v2/groups/{groupOpenId}/messages",
+            BuildMediaMessagePayload(fileInfo, msgId, msgSeq), cancellationToken).ConfigureAwait(false);
+        await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task SendC2CImageAsync(string openId, string fileInfo, string? msgId, int msgSeq,
+        CancellationToken cancellationToken)
+    {
+        using var response = await SendAuthorizedAsync(HttpMethod.Post, $"/v2/users/{openId}/messages",
+            BuildMediaMessagePayload(fileInfo, msgId, msgSeq), cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
