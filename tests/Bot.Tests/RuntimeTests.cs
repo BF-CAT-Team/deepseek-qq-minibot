@@ -686,6 +686,20 @@ public sealed class RuntimeTests
     }
 
     [Fact]
+    public async Task FirstSpeaker_GetsGroupMateNumber_NotPasserby()
+    {
+        await using var h = new Harness();
+
+        await h.SendAsync("路过", openId: "open-temp", mention: false);
+        h.Clock.Advance(1);
+        await h.TurnAsync("@小助手 在吗", openId: "open-1");
+
+        var tail = h.Model.Requests[^1].Messages[^1].Content;
+        Assert.Contains("群友01", tail);
+        Assert.DoesNotContain("路人A", tail);
+    }
+
+    [Fact]
     public void Trigger_PureEmojiIsNoise()
     {
         Assert.True(TriggerEngine.IsOnlyNoise("😂😂😂"));

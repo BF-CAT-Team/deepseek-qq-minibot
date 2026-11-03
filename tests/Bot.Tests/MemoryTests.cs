@@ -151,7 +151,7 @@ public sealed class MemoryTests
     }
 
     [Fact]
-    public async Task Identity_MaterialisesOnlyAfterThreshold()
+    public async Task Identity_MaterialisesOnFirstMessage()
     {
         await using var h = new Harness();
         var message = new Bot.Core.Domain.IncomingMessage
@@ -164,12 +164,19 @@ public sealed class MemoryTests
         };
 
         var first = h.Identity.Resolve(message, "小助手");
-        Assert.False(first.Materialized);
-        Assert.StartsWith("路人", first.DisplayLabel);
+        Assert.True(first.Materialized);
+        Assert.True(first.PersonId > 0);
+        Assert.StartsWith("群友", first.DisplayLabel);
+
+        // 第一条消息就建档，但空档案不会进前缀。
+        var row = h.Identity.GetPerson(first.PersonId);
+        Assert.NotNull(row);
+        Assert.Equal(1, row!.MsgCount);
 
         var second = h.Identity.Resolve(message, "小助手");
         Assert.True(second.Materialized);
-        Assert.StartsWith("群友", second.DisplayLabel);
+        Assert.Equal(first.PersonId, second.PersonId);
+        Assert.Equal(2, h.Identity.GetPerson(first.PersonId)!.MsgCount);
     }
 
     [Fact]

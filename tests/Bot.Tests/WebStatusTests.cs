@@ -1,6 +1,8 @@
 using Bot.Core.Abstractions;
 using Bot.Core.Config;
 using Bot.Core.Domain;
+using Bot.Core.Llm;
+using Bot.Core.Memory;
 using Bot.Core.Runtime;
 using Bot.QQ;
 using Xunit;
@@ -78,6 +80,7 @@ public sealed class WebStatusTests
         Assert.NotNull(view);
         Assert.Equal("active", view!.State);
         Assert.Equal(2, view.Turns.Count);
+        Assert.Null(view.Summary); // 会话还没结束，总结不存在
 
         Assert.Equal("user", view.Turns[0].Role);
         Assert.Equal("dynamic_tail", view.Turns[0].Kind);
@@ -152,6 +155,67 @@ public sealed class WebStatusTests
         var summary = view.Requests.Single(r => r.Kind == "summary");
         Assert.True(summary.ParseOk);
         Assert.Equal(120, summary.LatencyMs);
+    }
+
+    [Fact]
+    public async Task Session_view_shows_the_summary_request_and_what_it_wrote()
+    {
+        await using var h = new Harness();
+        h.Model.Reply = request =>
+            request.Messages[^1].Content.Contains("【任务】", StringComparison.Ordinal)
+                ? "UPDATE_PERSON|群友01|爱摸鱼，常约饭"
+                : "好啊，那就这么定了。";
+
+        await h.TurnAsync("记住我喜欢摸鱼");
+        var sessionId = h.Runtime.Snapshot().Single().SessionId;
+        Assert.NotNull(sessionId);
+
+        await h.Runtime.ForceRotateAsync(Harness.ChatId);
+
+        var inspector = new SessionInspector(h.Db, h.Sessions, h.Logs, h.Estimator);
+        var view = inspector.Get(sessionId!);
+
+        Assert.NotNull(view);
+        var summary = view!.Summary;
+        Assert.NotNull(summary);
+        Assert.Equal("UPDATE_PERSON|群友01|爱摸鱼，常约饭", summary!.Reply);
+        Assert.True(summary.ParseOk);
+        Assert.False(summary.IsNone);
+        Assert.Equal(1, summary.Applied);
+        Assert.NotNull(summary.BatchId);
+        Assert.Contains(summary.AppliedLines, line => line.Contains("UPDATE_PERSON", StringComparison.Ordinal));
+
+        // 总结请求的 messages 必须与真正发出去的那次逐条一致（含最后的总结指令）。
+        var request = h.Model.Requests.Last(r => r.Messages[^1].Content.Contains("【任务】", StringComparison.Ordinal));
+        Assert.Equal(request.Messages.Count, summary.Messages.Count);
+        Assert.Equal("system", summary.Messages[0].Role);
+        Assert.Equal(request.Messages[^1].Content, summary.Messages[^1].Content);
+        Assert.Equal(SummaryParser.Template, summary.Messages[^1].Content);
+
+        // 总结说写了什么，记忆库里就该是什么。
+        Assert.Equal("爱摸鱼，常约饭", h.Identity.ListActive().Single().MemoryText);
+    }
+
+    [Fact]
+    public async Task Session_view_records_a_failed_summary()
+    {
+        await using var h = new Harness();
+        await h.TurnAsync("在吗");
+        var sessionId = h.Runtime.Snapshot().Single().SessionId;
+        Assert.NotNull(sessionId);
+
+        h.Model.FailWith = ErrorCodes.Network;
+        await h.Runtime.ForceRotateAsync(Harness.ChatId);
+
+        var inspector = new SessionInspector(h.Db, h.Sessions, h.Logs, h.Estimator);
+        var summary = inspector.Get(sessionId!)!.Summary;
+
+        Assert.NotNull(summary);
+        Assert.Equal(ErrorCodes.Network, summary!.ErrorCode);
+        Assert.Null(summary.Reply);
+        Assert.False(summary.ParseOk);
+        Assert.Equal(0, summary.Applied);
+        Assert.Equal(1, h.Wal.Count()); // 失败仍进 WAL，等后台补
     }
 
     [Fact]

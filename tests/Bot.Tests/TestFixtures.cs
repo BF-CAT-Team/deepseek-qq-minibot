@@ -21,6 +21,9 @@ public sealed class FakeChatModel : IChatModel
 {
     public Func<ChatCompletionRequest, string> Reply { get; set; } = _ => "好啊，那就这么定了。";
 
+    /// <summary>非空时所有请求都按这个错误码失败（测试总结失败的分支）。</summary>
+    public string? FailWith { get; set; }
+
     public List<ChatCompletionRequest> Requests { get; } = new();
 
     public Task<LlmResult> CompleteAsync(ChatCompletionRequest request, CancellationToken cancellationToken)
@@ -28,6 +31,11 @@ public sealed class FakeChatModel : IChatModel
         lock (Requests)
         {
             Requests.Add(request);
+        }
+
+        if (FailWith is not null)
+        {
+            return Task.FromResult(LlmResult.Fail(FailWith, "测试用失败"));
         }
 
         var text = Reply(request);

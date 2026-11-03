@@ -53,9 +53,11 @@ public sealed class WebServer : IAsyncDisposable
         app.MapPost("/api/config", SaveConfig);
         app.MapGet("/api/params", () => Results.Json(BuildParams(), Json));
         app.MapPost("/api/params", SaveParams);
+        app.MapGet("/api/rules", () => Results.Json(BuildRules(), Json));
+        app.MapPost("/api/rules", SaveRules);
         app.MapPost("/api/test", TestConnection);
-        app.MapGet("/api/persons", () => Results.Json(ListPersons(), Json));
-        app.MapGet("/api/events", (string? q) => Results.Json(ListEvents(q), Json));
+        app.MapGet("/api/persons", (int? page, int? pageSize) => Results.Json(ListPersons(page, pageSize), Json));
+        app.MapGet("/api/events", (string? q, int? page, int? pageSize) => Results.Json(ListEvents(q, page, pageSize), Json));
         app.MapGet("/api/session", GetSession);
         app.MapGet("/api/prompt-framework", () => Results.Json(_host.Framework.Build(), Json));
         app.MapPost("/api/simulate", Simulate);
@@ -65,7 +67,7 @@ public sealed class WebServer : IAsyncDisposable
         app.MapGet("/api/stickers", () => Results.Json(ListStickers(), Json));
         app.MapPost("/api/stickers", SaveSticker);
         app.MapPost("/api/stickers/test", TestStickers);
-        app.MapGet("/api/stickers/log", (int? limit) => Results.Json(RecentStickerLog(limit ?? 50), Json));
+        app.MapGet("/api/stickers/log", (int? page, int? pageSize) => Results.Json(RecentStickerLog(page, pageSize), Json));
         app.MapPost("/api/stickers/{id:int}/enabled", SetStickerEnabled);
         app.MapDelete("/api/stickers/{id:int}", DeleteSticker);
         app.MapGet("/api/stickers/{id:int}/image", GetStickerImage);
@@ -256,6 +258,61 @@ public sealed class WebServer : IAsyncDisposable
         }
     }
 
+    // ------------------------------------------------------------------ 规则块
+
+    /// <summary>
+    /// 「规则」块的单独编辑：返回当前生效的文本（用默认时直接返回内置模板，用户可以在上面改），
+    /// 同时返回内置模板本身，配置页「恢复默认」不用再猜默认值长什么样。
+    /// </summary>
+    private object BuildRules()
+    {
+        var persona = _host.Settings.Persona;
+        var custom = persona.Rules ?? string.Empty;
+        var isDefault = string.IsNullOrWhiteSpace(custom);
+        return new
+        {
+            text = isDefault ? PromptAssembler.DefaultRulesTemplate : custom,
+            template = PromptAssembler.DefaultRulesTemplate,
+            isDefault,
+            botName = persona.BotName,
+            replyLength = _host.Config.ForChat(string.Empty).ReplyLength,
+        };
+    }
+
+    /// <summary>
+    /// 保存自定义规则；<c>reset=true</c>（或文本为空）等于恢复内置默认。
+    /// 规则在冻结的前缀区里，改完由运行时的指纹比对在下次空闲时自动重建会话，不用重启。
+    /// </summary>
+    private async Task<IResult> SaveRules(HttpRequest request)
+    {
+        try
+        {
+            var body = await JsonSerializer.DeserializeAsync<JsonObject>(request.Body, Json).ConfigureAwait(false);
+            if (body is null)
+            {
+                return Results.BadRequest(new { error = "请求体为空" });
+            }
+
+            var reset = body["reset"]?.GetValue<bool>() ?? false;
+            var text = body["text"]?.GetValue<string>() ?? string.Empty;
+            var stored = reset || string.IsNullOrWhiteSpace(text) ? string.Empty : text.Trim();
+
+            _host.RebuildSettings(settings => settings.Persona.Rules = stored);
+
+            return Results.Json(new
+            {
+                ok = true,
+                isDefault = stored.Length == 0,
+                text = stored.Length == 0 ? PromptAssembler.DefaultRulesTemplate : stored,
+                warnings = _host.Config.Warnings,
+            }, Json);
+        }
+        catch (Exception ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
     // ------------------------------------------------------------------ 参数
 
     private object BuildParams()
@@ -393,8 +450,21 @@ public sealed class WebServer : IAsyncDisposable
     }
 
     // ------------------------------------------------------------------ 记忆
-    private object ListPersons() =>
-        _host.Identity.ListActive(500).Select(p => new
+
+    /// <summary>分页参数归一化：页大小 5–200，页码超出范围时收敛到最后一页。</summary>
+    private static (int Page, int Size, int Offset) ResolvePaging(int? page, int? pageSize, int total)
+    {
+        var size = Math.Clamp(pageSize ?? 20, 5, 200);
+        var pages = Math.Max(1, (total + size - 1) / size);
+        var current = Math.Clamp(page ?? 1, 1, pages);
+        return (current, size, (current - 1) * size);
+    }
+
+    private object ListPersons(int? page, int? pageSize)
+    {
+        var total = _host.Identity.CountActive();
+        var (current, size, offset) = ResolvePaging(page, pageSize, total);
+        var items = _host.Identity.ListActivePage(offset, size).Select(p => new
         {
             personId = p.PersonId,
             openId = p.OpenId,
@@ -406,13 +476,14 @@ public sealed class WebServer : IAsyncDisposable
             pinned = p.Pinned,
         }).ToArray();
 
-    private object ListEvents(string? query)
-    {
-        var rows = string.IsNullOrWhiteSpace(query)
-            ? _host.Events.LoadAll(null, 200)
-            : _host.Events.Search(query, 100);
+        return new { total, page = current, pageSize = size, items };
+    }
 
-        return rows.Select(e => new
+    private object ListEvents(string? query, int? page, int? pageSize)
+    {
+        var total = _host.Events.Count(query);
+        var (current, size, offset) = ResolvePaging(page, pageSize, total);
+        var items = _host.Events.Page(query, offset, size).Select(e => new
         {
             eventId = e.EventId,
             timeText = e.TimeText,
@@ -423,6 +494,8 @@ public sealed class WebServer : IAsyncDisposable
             pinned = e.Pinned,
             injectedCount = e.InjectedCount,
         }).ToArray();
+
+        return new { total, page = current, pageSize = size, items };
     }
 
     /// <summary>
@@ -709,21 +782,28 @@ public sealed class WebServer : IAsyncDisposable
         }, Json);
     }
 
-    private object RecentStickerLog(int limit) => _host.Stickers.RecentLog(limit).Select(row => new
+    private object RecentStickerLog(int? page, int? pageSize)
     {
-        id = row.Id,
-        chatId = row.ChatId,
-        stickerId = row.StickerId,
-        keywords = row.Keywords,
-        score = row.Score,
-        threshold = row.Threshold,
-        probability = row.Probability,
-        roll = row.Roll,
-        result = row.Result,
-        mode = row.Mode,
-        replyExcerpt = row.ReplyExcerpt,
-        createdAt = row.CreatedAt,
-    }).ToArray();
+        var total = _host.Stickers.LogCount();
+        var (current, size, offset) = ResolvePaging(page, pageSize, total);
+        var items = _host.Stickers.LogPage(offset, size).Select(row => new
+        {
+            id = row.Id,
+            chatId = row.ChatId,
+            stickerId = row.StickerId,
+            keywords = row.Keywords,
+            score = row.Score,
+            threshold = row.Threshold,
+            probability = row.Probability,
+            roll = row.Roll,
+            result = row.Result,
+            mode = row.Mode,
+            replyExcerpt = row.ReplyExcerpt,
+            createdAt = row.CreatedAt,
+        }).ToArray();
+
+        return new { total, page = current, pageSize = size, items };
+    }
 
     private static string JsonString(JsonObject? body, string name)
     {

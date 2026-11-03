@@ -16,8 +16,8 @@ public sealed record StickerAttempt(
     string ChatId,
     int StickerId,
     string Keywords,
-    double Score,
-    double Threshold,
+    decimal Score,
+    decimal Threshold,
     double Probability,
     double Roll,
     string Result,
@@ -259,8 +259,9 @@ public sealed class StickerStore
             ("@chat", attempt.ChatId),
             ("@id", attempt.StickerId),
             ("@keywords", attempt.Keywords),
-            ("@score", Math.Round(attempt.Score, 2)),
-            ("@threshold", attempt.Threshold),
+            // 库里是 REAL 列：写入时转成 double，精度只影响展示用的历史记录。
+            ("@score", (double)attempt.Score),
+            ("@threshold", (double)attempt.Threshold),
             ("@probability", attempt.Probability),
             ("@roll", Math.Round(attempt.Roll, 4)),
             ("@result", attempt.Result),
@@ -296,6 +297,35 @@ public sealed class StickerStore
                 reader.GetInt64(11)),
             ("@n", limit));
     }
+
+    /// <summary>配置页分页：最新的记录在前。</summary>
+    public IReadOnlyList<StickerLogRow> LogPage(int offset, int limit)
+    {
+        limit = Math.Clamp(limit, 1, 500);
+        return _db.Query(
+            """
+            SELECT id, chat_id, sticker_id, keywords, score, threshold, probability, roll,
+                   result, mode, reply_excerpt, created_at
+            FROM sticker_log ORDER BY id DESC LIMIT @n OFFSET @o
+            """,
+            reader => new StickerLogRow(
+                reader.GetInt64(0),
+                reader.GetString(1),
+                reader.GetInt32(2),
+                reader.GetString(3),
+                reader.GetDouble(4),
+                reader.GetDouble(5),
+                reader.GetDouble(6),
+                reader.GetDouble(7),
+                reader.GetString(8),
+                reader.GetString(9),
+                reader.GetString(10),
+                reader.GetInt64(11)),
+            ("@n", limit),
+            ("@o", offset));
+    }
+
+    public int LogCount() => (int)_db.ScalarLong("SELECT COUNT(*) FROM sticker_log");
 
     /// <summary>这个聊天上一次真正发出表情包的时间（冷却判断用）。</summary>
     public DateTimeOffset? LastSentAt(string chatId)

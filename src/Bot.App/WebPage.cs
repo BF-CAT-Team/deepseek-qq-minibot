@@ -68,6 +68,12 @@ public static class WebPage
   .tag.ok{background:#14352a;color:var(--ok)}
   .tag.warn{background:#3a2f18;color:var(--warn)}
   .tag.err{background:#3a1d1d;color:var(--err)}
+  .pager{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:10px;font-size:12px;color:var(--dim)}
+  .pager .grow{flex:1}
+  .pager button{padding:2px 9px;border:1px solid var(--line);border-radius:6px;background:transparent;color:var(--text);cursor:pointer;font-size:12px}
+  .pager button.current{background:var(--accent);border-color:var(--accent);color:#fff}
+  .pager button:disabled{opacity:.4;cursor:default}
+  .pager select{width:auto;padding:2px 6px;font-size:12px}
   .modal{position:fixed;inset:0;background:rgba(4,7,11,.74);display:none;align-items:flex-start;justify-content:center;padding:32px 16px;z-index:50;overflow:auto}
   .modal.open{display:flex}
   .modal-box{background:var(--bg);border:1px solid var(--line);border-radius:12px;width:min(960px,100%);padding:16px 18px 22px;box-shadow:0 24px 70px rgba(0,0,0,.55)}
@@ -151,6 +157,20 @@ public static class WebPage
 
   <section id="tab-tuning">
     <div class="card">
+      <h2>规则（可单独修改）</h2>
+      <div class="hint" style="margin-top:0">
+        这段文本就是每次请求最前面的「规则」块。占位符 <code>{名字}</code> / <code>{场景}</code> / <code>{字数}</code>
+        会在组装时替换成当前机器人名字、群聊或私聊、回复字数上限；不写占位符就是固定文本。
+        规则属于冻结的前缀区，保存后当前会话会在下次空闲时自动重建（不用重启）。
+      </div>
+      <textarea id="rulesText" rows="10" spellcheck="false" style="width:100%;background:#0d1116;border:1px solid var(--line);color:var(--text);border-radius:7px;padding:8px 10px;font:inherit;font-family:Consolas,'Microsoft YaHei',monospace;font-size:12.5px;line-height:1.6"></textarea>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+        <button class="primary" onclick="saveRules()">保存规则</button>
+        <button class="ghost" onclick="resetRules()">恢复默认</button>
+        <span class="hint" id="rulesHint" style="margin:0"></span>
+      </div>
+    </div>
+    <div class="card">
       <h2>提示词框架（结构示例，不读取真实会话）</h2>
       <div class="hint" style="margin-top:0">这里只展示 prompt 的结构、当前规则/人设/字数上限；&lt;名字&gt;、&lt;时间&gt; 等是占位符。真实记忆和对话请看「本地试聊 → 当前会话」。</div>
       <div id="previewBody" style="margin-top:10px"><div class="hint">读取中…</div></div>
@@ -166,11 +186,13 @@ public static class WebPage
     <div class="card">
       <h2>人物</h2>
       <table><thead><tr><th>ID</th><th>名字</th><th>性格</th><th>评价</th><th>记忆</th><th>发言</th><th></th></tr></thead><tbody id="persons"></tbody></table>
+      <div id="personsPager"></div>
     </div>
     <div class="card">
       <h2>事件</h2>
-      <div style="display:flex;gap:8px;margin-bottom:10px"><input id="eventQuery" placeholder="搜索详情…"><button class="ghost" onclick="loadEvents()">搜索</button></div>
+      <div style="display:flex;gap:8px;margin-bottom:10px"><input id="eventQuery" placeholder="搜索详情…"><button class="ghost" onclick="searchEvents()">搜索</button></div>
       <table><thead><tr><th>ID</th><th>时间</th><th>详情</th><th>状态</th><th>注入</th></tr></thead><tbody id="events"></tbody></table>
+      <div id="eventsPager"></div>
     </div>
     <div class="card">
       <h2>回滚</h2>
@@ -266,6 +288,7 @@ public static class WebPage
         <thead><tr><th>时间</th><th>聊天</th><th>图片</th><th>得分 / 阈值</th><th>概率 / roll</th><th>方式</th><th>结果</th></tr></thead>
         <tbody id="stickerLog"></tbody>
       </table>
+      <div id="stickerLogPager"></div>
       <div class="hint">「概率不过」= 命中了但骰子没过；「无 msg_id」= 没有可被动回复的消息且主动发送已关闭；「失败」= 上传或发送被 QQ 拒绝，看日志。</div>
     </div>
   </section>
@@ -295,7 +318,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   b.classList.add('active');
   document.getElementById('tab-'+b.dataset.tab).classList.add('active');
   if(b.dataset.tab==='memory'){loadPersons();loadEvents();}
-  if(b.dataset.tab==='tuning'){loadParams();loadPromptFramework();}
+  if(b.dataset.tab==='tuning'){loadParams();loadPromptFramework();loadRules();}
   if(b.dataset.tab==='connect')loadStatus();
   if(b.dataset.tab==='sim'){loadStatus();}
   if(b.dataset.tab==='sticker'){loadStickers();loadStickerSettings();loadStickerLog();}
@@ -434,6 +457,8 @@ async function loadConfig(){
 }
 
 async function saveConfig(){
+  // 重新取一份配置再改：cfg 是页面加载时的快照，直接回传会把别的页签刚保存的内容（比如规则块）覆盖掉。
+  cfg = await api('/api/config');
   const body = JSON.parse(JSON.stringify(cfg));
   body.llm.apiKey = document.getElementById('llmKey').value;
   body.llm.baseUrl = document.getElementById('llmBase').value;
@@ -547,25 +572,136 @@ function renderPromptFramework(f){
   document.getElementById('previewBody').innerHTML=html;
 }
 
+// ---------------------------------------------------------------- 规则块（单独编辑）
+async function loadRules(){
+  const box=document.getElementById('rulesText');
+  const hint=document.getElementById('rulesHint');
+  try{
+    const r=await api('/api/rules');
+    box.value=r.text||'';
+    hint.textContent = r.isDefault ? '当前：内置默认' : '当前：自定义';
+  }catch(e){
+    hint.textContent='读取失败：'+e.message;
+  }
+}
+
+async function saveRules(){
+  const hint=document.getElementById('rulesHint');
+  hint.textContent='保存中…';
+  try{
+    const r=await api('/api/rules',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:document.getElementById('rulesText').value})
+    });
+    document.getElementById('rulesText').value=r.text||'';
+    hint.textContent = r.isDefault ? '已保存：使用内置默认' : '已保存：自定义规则';
+    toast('规则已保存；当前会话空闲后重建');
+    await loadPromptFramework();
+    await loadConfig();
+  }catch(e){
+    hint.textContent='保存失败：'+e.message;
+  }
+}
+
+async function resetRules(){
+  if(!confirm('恢复默认规则？当前自定义内容会被清空。')) return;
+  const hint=document.getElementById('rulesHint');
+  hint.textContent='恢复中…';
+  try{
+    const r=await api('/api/rules',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({reset:true})
+    });
+    document.getElementById('rulesText').value=r.text||'';
+    hint.textContent='已恢复默认';
+    toast('已恢复默认规则');
+    await loadPromptFramework();
+    await loadConfig();
+  }catch(e){
+    hint.textContent='恢复失败：'+e.message;
+  }
+}
+
+// ---------------------------------------------------------------- 分页（人物 / 事件 / 表情包命中）
+const PAGE_SIZE_OPTIONS=[10,20,50,100];
+const paged={persons:{page:1,size:20,total:0},events:{page:1,size:20,total:0},sticker:{page:1,size:20,total:0}};
+const PAGE_LOADERS={persons:()=>loadPersons(),events:()=>loadEvents(),sticker:()=>loadStickerLog()};
+
+function initPaged(){
+  Object.keys(paged).forEach(k=>{
+    const saved=+(localStorage.getItem('pageSize.'+k)||20);
+    paged[k].size=PAGE_SIZE_OPTIONS.includes(saved)?saved:20;
+  });
+}
+
+function pageCount(key){return Math.max(1,Math.ceil(paged[key].total/paged[key].size));}
+
+function gotoPage(key,page){
+  paged[key].page=Math.min(Math.max(1,page),pageCount(key));
+  PAGE_LOADERS[key]();
+}
+
+function changePageSize(key,value){
+  const size=+value;
+  paged[key].size=PAGE_SIZE_OPTIONS.includes(size)?size:20;
+  paged[key].page=1;
+  try{localStorage.setItem('pageSize.'+key,paged[key].size);}catch(e){}
+  PAGE_LOADERS[key]();
+}
+
+function renderPager(key,hostId){
+  const st=paged[key];
+  const pages=pageCount(key);
+  const nums=[];
+  const add=p=>{if(p>=1&&p<=pages&&!nums.includes(p))nums.push(p);};
+  add(1);
+  for(let p=Math.max(2,st.page-2);p<=Math.min(pages-1,st.page+2);p++)add(p);
+  add(pages);
+  nums.sort((a,b)=>a-b);
+
+  let html=`<div class="pager">
+    <span>共 ${st.total} 条</span>
+    <span>每页 <select onchange="changePageSize('${key}',this.value)">${PAGE_SIZE_OPTIONS.map(n=>`<option ${n===st.size?'selected':''}>${n}</option>`).join('')}</select> 条</span>
+    <span class="grow"></span>
+    <button ${st.page<=1?'disabled':''} onclick="gotoPage('${key}',${st.page-1})">‹ 上一页</button>`;
+  let previous=0;
+  nums.forEach(p=>{
+    if(previous && p-previous>1) html+='<span>…</span>';
+    html+=`<button class="${p===st.page?'current':''}" onclick="gotoPage('${key}',${p})">${p}</button>`;
+    previous=p;
+  });
+  html+=`<button ${st.page>=pages?'disabled':''} onclick="gotoPage('${key}',${st.page+1})">下一页 ›</button></div>`;
+  document.getElementById(hostId).innerHTML=html;
+}
+
+// 最新的在前：人物按最近更新、事件与表情包命中按 id 倒序。
 async function loadPersons(){
-  const rows=await api('/api/persons');
+  const st=paged.persons;
+  const r=await api(`/api/persons?page=${st.page}&pageSize=${st.size}`);
+  st.page=r.page; st.total=r.total;
   const tb=document.getElementById('persons'); tb.innerHTML='';
-  rows.forEach(p=>{
+  (r.items||[]).forEach(p=>{
     tb.innerHTML+=`<tr><td><code>P${String(p.personId).padStart(3,'0')}</code></td><td>${esc(p.name)||'—'}</td><td>${esc(p.personality)||'—'}</td><td>${esc(p.evaluation)||'—'}</td><td>${esc(p.memoryText)||'—'}</td><td>${p.msgCount}</td>
     <td><button class="ghost" style="padding:2px 8px" onclick="forget('${p.openId}')">忘记</button></td></tr>`;
   });
-  if(!rows.length) tb.innerHTML='<tr><td colspan="7" style="color:var(--dim)">还没有人物记忆</td></tr>';
+  if(!(r.items||[]).length) tb.innerHTML='<tr><td colspan="7" style="color:var(--dim)">还没有人物记忆</td></tr>';
+  renderPager('persons','personsPager');
 }
 
 async function loadEvents(){
   const q=document.getElementById('eventQuery').value||'';
-  const rows=await api('/api/events?q='+encodeURIComponent(q));
+  const st=paged.events;
+  const r=await api(`/api/events?q=${encodeURIComponent(q)}&page=${st.page}&pageSize=${st.size}`);
+  st.page=r.page; st.total=r.total;
   const tb=document.getElementById('events'); tb.innerHTML='';
-  rows.forEach(e=>{
+  (r.items||[]).forEach(e=>{
     tb.innerHTML+=`<tr><td><code>E${String(e.eventId).padStart(3,'0')}</code></td><td>${esc(e.timeText)||'—'}</td><td>${esc(e.detail)}</td><td>${e.status}</td><td>${e.injectedCount}</td></tr>`;
   });
-  if(!rows.length) tb.innerHTML='<tr><td colspan="5" style="color:var(--dim)">没有事件</td></tr>';
+  if(!(r.items||[]).length) tb.innerHTML='<tr><td colspan="5" style="color:var(--dim)">没有事件</td></tr>';
+  renderPager('events','eventsPager');
 }
+
+function searchEvents(){paged.events.page=1;loadEvents();}
 
 async function forget(openId){
   if(!confirm('删除这个人的全部记忆？')) return;
@@ -577,7 +713,8 @@ async function rollback(){
   const batchId=document.getElementById('batchId').value.trim();
   if(!batchId) return;
   try{const r=await api('/api/memory/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batchId})});
-    toast('已回滚 '+r.reverted+' 条');}catch(e){toast('回滚失败：'+e.message);}
+    toast('已回滚 '+r.reverted+' 条');
+    loadPersons();loadEvents();}catch(e){toast('回滚失败：'+e.message);}
 }
 
 // ---------------------------------------------------------------- 会话详情（API 侧 messages）
@@ -666,6 +803,14 @@ function renderSession(v){
     html += '<div class="hint">这个会话还没有成功发出过请求，所以只有前缀，没有对话历史。</div>';
   }
 
+  if(v.summary){
+    html += renderSessionSummary(v.summary);
+  } else if(v.state==='closed'){
+    html += `<div class="hint" style="margin-top:14px">
+      这个会话没有留下总结记录：可能是旧版本结束的会话，或总结请求失败后没有再重试。
+      从本版本起，会话结束时的总结原文与入库结果都会记在这里。</div>`;
+  }
+
   if((v.requests||[]).length){
     html += `<h3 style="font-size:13px;color:var(--accent);margin:18px 0 6px">最近调用（request_log）</h3>
       <table><thead><tr><th>时间</th><th>类型</th><th>模型</th><th>prompt</th><th>命中 / 未命中</th><th>输出</th><th>延迟</th><th>状态</th></tr></thead><tbody>`;
@@ -684,6 +829,69 @@ function renderSession(v){
   }
 
   document.getElementById('sessionBody').innerHTML = html;
+}
+
+// 总结不是对话的一部分，但用户排查"它到底记住了什么"时最想看它：
+// 模型收到的请求、返回的总结原文、以及最后真正写进记忆库的行，都摊开在这里。
+function renderSessionSummary(s){
+  const status = s.errorCode
+    ? `<span class="tag err">${esc(s.errorCode)}</span>`
+    : (s.parseOk
+        ? (s.isNone ? '<span class="tag ok">无新增记忆（NONE）</span>' : '<span class="tag ok">已解析</span>')
+        : '<span class="tag warn">格式未通过解析</span>');
+
+  let html = `<h3 class="preview-title" style="margin-top:20px">总结（会话结束时发给模型的请求与返回）</h3>
+    <div class="meta">
+      <span><b>状态</b> ${status}</span>
+      <span><b>模型</b> ${esc(s.model)}</span>
+      <span><b>请求时间</b> ${fmtUnix(s.createdAt)}</span>
+      <span><b>格式重试</b> ${s.attempts||0} 次</span>
+      <span><b>入库</b> 成功 ${s.applied||0} · 跳过 ${s.skipped||0}</span>
+      ${s.batchId?`<span><b>批次</b> <code>${esc(s.batchId)}</code></span>`:''}
+    </div>`;
+
+  html += `<div class="conv">
+    <div class="conv-head">
+      <span class="role assistant">assistant</span>
+      <span class="tag">总结原文</span>
+      <span style="flex:1"></span>
+      <span class="hint" style="margin:0">NEW_PERSON / UPDATE_PERSON / NEW_EVENT / NAME / PIN</span>
+    </div>
+    <div class="conv-body">${esc(s.reply || (s.errorCode ? '（请求失败，没有返回内容）' : '（这一轮没有返回内容）'))}</div>
+  </div>`;
+
+  if((s.appliedLines||[]).length){
+    html += `<details class="conv" open>
+      <summary class="conv-head"><span class="tag ok">写入的记忆</span><span>${s.appliedLines.length} 条</span></summary>
+      <div class="conv-body">${s.appliedLines.map(x=>esc(x)).join('\n')}</div>
+    </details>`;
+  }
+
+  if((s.warnings||[]).length){
+    html += `<details class="conv">
+      <summary class="conv-head"><span class="tag warn">告警 ${s.warnings.length} 条</span>
+        <span class="hint" style="margin:0">被拒或被跳过的行都在这里</span></summary>
+      <div class="conv-body">${s.warnings.map(x=>esc(x)).join('\n')}</div>
+    </details>`;
+  }
+
+  if((s.messages||[]).length){
+    html += `<details class="conv">
+      <summary class="conv-head"><span class="tag">总结请求 messages</span>
+        <span>${s.messages.length} 条（前缀 + 全部回合 + 总结指令）</span></summary>
+      <div class="conv-body">`;
+    s.messages.forEach((m,i)=>{
+      html += `<div style="margin-bottom:12px">
+        <span class="role ${esc(m.role)}">${esc(m.role)}</span>
+        <span class="tag">#${i+1}</span>
+        <span class="tag">≈${fmtNum(m.tokens)} token</span>
+        <div style="margin-top:4px;white-space:pre-wrap">${esc(m.content)}</div>
+      </div>`;
+    });
+    html += `</div></details>`;
+  }
+
+  return html;
 }
 
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeSession();});
@@ -866,25 +1074,28 @@ async function testSticker(){
 
 async function loadStickerLog(){
   try{
-    const rows=await api('/api/stickers/log?limit=50')||[];
+    const st=paged.sticker;
+    const r=await api(`/api/stickers/log?page=${st.page}&pageSize=${st.size}`)||{};
+    st.page=r.page||1; st.total=r.total||0;
     const tb=document.getElementById('stickerLog'); tb.innerHTML='';
-    rows.forEach(r=>{
-      const tone=r.result==='sent'?'ok':r.result==='failed'?'err':'';
-      tb.innerHTML+=`<tr><td>${fmtUnix(r.createdAt)}</td>
-        <td><code style="font-size:11px">${esc(short(r.chatId))}</code></td>
-        <td><code>${esc(r.keywords)}</code><div class="hint">#${r.stickerId}</div></td>
-        <td>${r.score} / ${r.threshold}</td>
-        <td>${r.probability} / ${r.roll}</td>
-        <td>${esc(STICKER_MODE[r.mode]||r.mode)}</td>
-        <td><span class="tag ${tone}">${esc(STICKER_RESULT[r.result]||r.result)}</span></td></tr>`;
+    (r.items||[]).forEach(row=>{
+      const tone=row.result==='sent'?'ok':row.result==='failed'?'err':'';
+      tb.innerHTML+=`<tr><td>${fmtUnix(row.createdAt)}</td>
+        <td><code style="font-size:11px">${esc(short(row.chatId))}</code></td>
+        <td><code>${esc(row.keywords)}</code><div class="hint">#${row.stickerId}</div></td>
+        <td>${row.score} / ${row.threshold}</td>
+        <td>${row.probability} / ${row.roll}</td>
+        <td>${esc(STICKER_MODE[row.mode]||row.mode)}</td>
+        <td><span class="tag ${tone}">${esc(STICKER_RESULT[row.result]||row.result)}</span></td></tr>`;
     });
-    if(!rows.length) tb.innerHTML='<tr><td colspan="7" style="color:var(--dim)">还没有命中记录。回复里出现关键词后这里会有记录（被概率拦下的也会记）。</td></tr>';
+    if(!(r.items||[]).length) tb.innerHTML='<tr><td colspan="7" style="color:var(--dim)">还没有命中记录。回复里出现关键词后这里会有记录（被概率拦下的也会记）。</td></tr>';
+    renderPager('sticker','stickerLogPager');
   }catch(e){/* 忽略 */}
 }
 
 function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function short(h){return h?h.slice(0,14)+'…':'—';}
-loadConfig();loadStatus();setInterval(loadStatus,5000);
+initPaged();loadConfig();loadStatus();setInterval(loadStatus,5000);
 </script>
 </body>
 </html>

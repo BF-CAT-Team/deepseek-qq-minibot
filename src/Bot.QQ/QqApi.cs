@@ -111,6 +111,16 @@ public sealed class QqApi
         }
     }
 
+    /// <summary>
+    /// 丢弃缓存的 access_token，下次请求重新换取。收到 HTTP 401 或网关关闭码 4004 时调用：
+    /// 否则会拿着已失效的票一直重试，直到缓存自然过期（最长 2 小时）。
+    /// </summary>
+    public void InvalidateToken()
+    {
+        _accessToken = null;
+        _expiresAt = DateTimeOffset.MinValue;
+    }
+
     public async Task<string> GetGatewayAsync(CancellationToken cancellationToken)
     {
         _trace?.Invoke("请求网关地址 /gateway");
@@ -260,6 +270,22 @@ public sealed class QqApi
         CancellationToken cancellationToken)
     {
         var token = await GetTokenAsync(cancellationToken).ConfigureAwait(false);
+        var response = await SendOnceAsync(method, path, payload, token, cancellationToken).ConfigureAwait(false);
+        if (response.StatusCode != System.Net.HttpStatusCode.Unauthorized)
+        {
+            return response;
+        }
+
+        // 缓存的票被服务端提前判废：丢票重换一次再发，别让发送一直 401 直到缓存自然过期。
+        response.Dispose();
+        InvalidateToken();
+        token = await GetTokenAsync(cancellationToken).ConfigureAwait(false);
+        return await SendOnceAsync(method, path, payload, token, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<HttpResponseMessage> SendOnceAsync(HttpMethod method, string path, object? payload,
+        string token, CancellationToken cancellationToken)
+    {
         var request = new HttpRequestMessage(method, ApiBase + path);
         request.Headers.Authorization = new AuthenticationHeaderValue("QQBot", token);
         if (payload is not null)

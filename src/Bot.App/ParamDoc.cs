@@ -109,7 +109,8 @@ public static class ParamDoc
         b.AppendLine("  \"persona\": {");
         b.AppendLine("    \"botName\": \"小助手\",             // 名字也是触发词（≥2 字生效）");
         b.AppendLine("    \"persona\": \"二十多岁，话不多…\",");
-        b.AppendLine("    \"extraRules\": \"\"               // 追加到规则块末尾的额外约束");
+        b.AppendLine("    \"extraRules\": \"\",              // 追加到规则块末尾的额外约束");
+        b.AppendLine("    \"rules\": \"\"                    // 自定义「规则」块；空=内置默认，支持 {名字}/{场景}/{字数}");
         b.AppendLine("  },");
         b.AppendLine("  \"server\": { \"host\": \"127.0.0.1\", \"port\": 8765, \"openBrowserOnStart\": true },");
         b.AppendLine("  \"chats\": {                      // 按群覆盖，键是 chat_id");
@@ -247,7 +248,7 @@ public static class ParamDoc
         b.AppendLine();
         b.AppendLine("1. `person_memory_limit` 调大（单人画像能写多少字）；");
         b.AppendLine("2. `event_topk`、`event_score_threshold` 调整注入的事件数量与门槛；");
-        b.AppendLine("3. `person_materialize_min_msgs` 调小（更容易给陌生人建档，但人物表会变大）；");
+        b.AppendLine("3. 现在第一次发言就会建档，记忆质量主要取决于总结；");
         b.AppendLine("4. 配置页「记忆」页可以直接看它到底记住了什么，也能按批次回滚。");
         b.AppendLine();
     }

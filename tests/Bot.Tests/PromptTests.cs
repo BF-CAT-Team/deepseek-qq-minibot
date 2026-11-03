@@ -37,7 +37,8 @@ public sealed class PromptTests
             Array.Empty<PersonRow>(), Array.Empty<EventRow>(), null);
 
         Assert.Contains("回复字数：30 字内", prefix.Text);
-        Assert.Contains("若回答的内容较长，可以委婉地说自己不知道", prefix.Text);
+        Assert.Contains("对于无害的要求，尽可能在满足要求的条件下进行回复", prefix.Text);
+        Assert.Contains("对于负面的要求，可以委婉的拒绝", prefix.Text);
         Assert.Contains("想点名谁就称呼其名字，没有名字就用群友", prefix.Text);
 
         var tail = assembler.BuildTail(new PromptTailContext(
@@ -49,6 +50,27 @@ public sealed class PromptTests
         Assert.DoesNotContain("近10分钟", tail.Text);
         Assert.DoesNotContain("上一条来自", tail.Text);
         Assert.Contains("回复：最多 30 字", tail.Text);
+    }
+
+    [Fact]
+    public void Tail_ShowsFullDateOnFirstTurn_ThenOnlyTime()
+    {
+        var assembler = new PromptAssembler(new Bot.Core.Text.TokenEstimator());
+        var cfg = new EffectiveConfig(ConfigResolver.Resolve(Presets.Balanced, null, null));
+        var now = new DateTimeOffset(2026, 10, 31, 14, 33, 0, TimeSpan.FromHours(8));
+
+        PromptTail Build(bool firstTurn) => assembler.BuildTail(new PromptTailContext(
+            "c1", null, ChatKind.Group, now,
+            new[] { new TailMessage("群友01", "在吗") }, 40,
+            FirstTurn: firstTurn));
+
+        var first = Build(true);
+        var later = Build(false);
+
+        Assert.Contains("2026-10-31 周六 14:33", first.Text);
+        Assert.Contains("14:33", later.Text);
+        Assert.DoesNotContain("2026-10-31", later.Text);
+        Assert.DoesNotContain("周六", later.Text);
     }
 
     [Fact]
@@ -159,6 +181,76 @@ public sealed class PromptTests
         Assert.Equal("system", framework.Summary[0].Role);
         Assert.Equal("user", framework.Summary[^1].Role);
         Assert.Equal(SummaryParser.Template, framework.Summary[^1].Content);
+    }
+
+    [Fact]
+    public void Custom_rules_replace_the_default_block_and_fill_placeholders()
+    {
+        var cfg = new EffectiveConfig(ConfigResolver.Resolve(
+            Presets.Balanced,
+            new JsonObject { ["reply_length"] = 42 },
+            null));
+        var assembler = new PromptAssembler(new Bot.Core.Text.TokenEstimator());
+        var persona = new PersonaSettings
+        {
+            BotName = "小鲸鱼",
+            Rules = "【规则】\n1. 你是{名字}，在{场景}里说话，最多{字数}字。\n2. 不说脏话。",
+        };
+
+        var prefix = assembler.BuildPrefix("c1", cfg, persona, ChatKind.Group,
+            Array.Empty<PersonRow>(), Array.Empty<EventRow>(), null);
+
+        Assert.Contains("1. 你是小鲸鱼，在群聊里说话，最多42字。", prefix.Text);
+        Assert.Contains("2. 不说脏话。", prefix.Text);
+        Assert.DoesNotContain("像熟人一样说话", prefix.Text); // 默认规则被整块替换
+    }
+
+    [Fact]
+    public void Custom_rules_keep_extra_rules_and_switch_scene_for_direct_chat()
+    {
+        var cfg = new EffectiveConfig(ConfigResolver.Resolve(Presets.Balanced, null, null));
+        var assembler = new PromptAssembler(new Bot.Core.Text.TokenEstimator());
+        var persona = new PersonaSettings
+        {
+            BotName = "小鲸鱼",
+            Rules = "【规则】\n1. 你在{场景}。",
+            ExtraRules = "7. 额外一条。",
+        };
+
+        var prefix = assembler.BuildPrefix("c1", cfg, persona, ChatKind.Direct,
+            Array.Empty<PersonRow>(), Array.Empty<EventRow>(), null);
+
+        Assert.Contains("1. 你在私聊。", prefix.Text);
+        Assert.Contains("7. 额外一条。", prefix.Text);
+    }
+
+    [Fact]
+    public void Blank_custom_rules_fall_back_to_the_built_in_default()
+    {
+        var cfg = new EffectiveConfig(ConfigResolver.Resolve(Presets.Balanced, null, null));
+        var assembler = new PromptAssembler(new Bot.Core.Text.TokenEstimator());
+        var persona = new PersonaSettings { BotName = "小鲸鱼", Rules = "  \n " };
+
+        var prefix = assembler.BuildPrefix("c1", cfg, persona, ChatKind.Group,
+            Array.Empty<PersonRow>(), Array.Empty<EventRow>(), null);
+
+        Assert.Contains("1. 你在群聊里扮演「小鲸鱼」", prefix.Text);
+        Assert.Contains("回复字数：40 字内", prefix.Text);
+    }
+
+    [Fact]
+    public void Prompt_framework_preview_uses_custom_rules()
+    {
+        var settings = new AppSettings { Preset = Presets.Balanced };
+        settings.Persona.Rules = "【规则】\n1. 自定义规则。";
+        var config = new ConfigService(settings);
+        var estimator = new Bot.Core.Text.TokenEstimator();
+        var service = new PromptFrameworkService(config, new PromptAssembler(estimator), estimator);
+
+        var framework = service.Build();
+
+        Assert.Contains("1. 自定义规则。", framework.ColdStart[0].Content);
+        Assert.DoesNotContain("像熟人一样说话", framework.ColdStart[0].Content);
     }
 
     private static PersonRow MakePerson(int id, string name, string personality, string evaluation, string memory) => new(

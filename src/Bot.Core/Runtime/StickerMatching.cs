@@ -3,10 +3,10 @@ using System.Globalization;
 namespace Bot.Core.Runtime;
 
 /// <summary>一个关键词及其权重。"笑死:2" 表示每次命中算 2 分；不写权重默认 1 分。</summary>
-public sealed record StickerKeyword(string Word, double Weight);
+public sealed record StickerKeyword(string Word, decimal Weight);
 
 /// <summary>某个关键词在某段回复里命中的情况（用于配置页试算展示）。</summary>
-public sealed record StickerHit(string Word, double Weight, int Count);
+public sealed record StickerHit(string Word, decimal Weight, int Count);
 
 /// <summary>图片库里的一个表情包（元数据；图片文件在 data\stickers\ 下）。</summary>
 public sealed record StickerRow(
@@ -21,10 +21,17 @@ public sealed record StickerRow(
     long CreatedAt,
     long UpdatedAt);
 
-/// <summary>一张表情包对某段回复的打分结果。<paramref name="Threshold"/> 是全局阈值，不是每张图自己的。</summary>
-public sealed record StickerScore(StickerRow Sticker, double Score, double Threshold, IReadOnlyList<StickerHit> Hits)
+/// <summary>
+/// 一张表情包对某段回复的打分结果。
+/// <para>
+/// 得分、权重、阈值全部用 <see cref="decimal"/>：0.1 + 0.2 精确等于 0.3，
+/// 比较时不再四舍五入、也不加浮点容差，避免"刚好达到阈值却被判不过"。
+/// </para>
+/// <para><paramref name="Threshold"/> 是全局阈值，不是每张图自己的。</para>
+/// </summary>
+public sealed record StickerScore(StickerRow Sticker, decimal Score, decimal Threshold, IReadOnlyList<StickerHit> Hits)
 {
-    public bool MeetsThreshold => Score + 1e-6 >= Threshold;
+    public bool MeetsThreshold => Score >= Threshold;
 
     public string HitText => string.Join('、', Hits.Select(h => h.Count > 1
         ? $"{h.Word}×{h.Count}"
@@ -44,10 +51,10 @@ public sealed record StickerScore(StickerRow Sticker, double Score, double Thres
 /// </summary>
 public static class StickerMatch
 {
-    public const double DefaultWeight = 1d;
-    public const double DefaultMinWeight = 2d;
-    public const double MinKeywordWeight = 0.1d;
-    public const double MaxKeywordWeight = 10d;
+    public const decimal DefaultWeight = 1m;
+    public const decimal DefaultMinWeight = 2m;
+    public const decimal MinKeywordWeight = 0.1m;
+    public const decimal MaxKeywordWeight = 10m;
     public const int MaxKeywords = 50;
 
     private static readonly char[] Separators = { ',', '，', ';', '；', '\n', '\r', '|' };
@@ -56,6 +63,7 @@ public static class StickerMatch
     /// <summary>
     /// 解析关键词串。支持「笑死」「笑死:2」「笑死：2」「笑死*2」；
     /// 分隔符是逗号 / 分号 / 换行 / 竖线。重复词只保留第一次出现的写法。
+    /// <para>权重用 decimal 解析：1.005 就是精确的 1.005，不会先变成二进制近似值。</para>
     /// </summary>
     public static IReadOnlyList<StickerKeyword> ParseKeywords(string? text)
     {
@@ -86,7 +94,7 @@ public static class StickerMatch
             var cut = item.LastIndexOfAny(WeightSeparators);
             if (cut > 0
                 && cut < item.Length - 1
-                && double.TryParse(item[(cut + 1)..].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture,
+                && decimal.TryParse(item[(cut + 1)..].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture,
                     out var parsed)
                 && parsed > 0)
             {
@@ -109,11 +117,11 @@ public static class StickerMatch
         return result;
     }
 
-    /// <summary>算一张图的得分。同一个词出现 N 次就是 N 份权重。阈值由调用方传入（全局）。</summary>
-    public static StickerScore Score(string? text, StickerRow sticker, double threshold)
+    /// <summary>算一张图的得分。同一个词出现 N 次就是 N 份权重；全程 decimal，不丢精度。</summary>
+    public static StickerScore Score(string? text, StickerRow sticker, decimal threshold)
     {
         var hits = new List<StickerHit>();
-        var score = 0d;
+        var score = 0m;
 
         if (!string.IsNullOrEmpty(text))
         {
@@ -130,10 +138,11 @@ public static class StickerMatch
             }
         }
 
-        return new StickerScore(sticker, Math.Round(score, 2), threshold, hits);
+        // 注意：这里不 Math.Round。舍入只用于展示，不能用于阈值判断与排名。
+        return new StickerScore(sticker, score, threshold, hits);
     }
 
-    public static IReadOnlyList<StickerScore> Score(string? text, IEnumerable<StickerRow> stickers, double threshold) =>
+    public static IReadOnlyList<StickerScore> Score(string? text, IEnumerable<StickerRow> stickers, decimal threshold) =>
         stickers.Select(sticker => Score(text, sticker, threshold)).ToArray();
 
     /// <summary>候选里取得分最高的一张；同分时取 sticker_id 小的，保证结果可预期、可测试。</summary>

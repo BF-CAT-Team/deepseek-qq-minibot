@@ -179,6 +179,34 @@ public sealed class QqMapperTests
     }
 
     [Fact]
+    public void AttachmentOnlyMessage_IsDropped()
+    {
+        const string payload = """
+            {"op":0,"t":"GROUP_MESSAGE_CREATE","s":48,"d":{
+              "id":"MSG-6","content":"<attachmentType=\"image/png\",attachmentIndex=0,description=\"eyJ0ZXh0IjoiW+WbvueJh10ifQ==\">",
+              "group_openid":"GRP",
+              "author":{"member_openid":"MEMBER-1"}}}
+            """;
+
+        Assert.Null(Map(payload));
+    }
+
+    [Fact]
+    public void AttachmentTag_IsStrippedButTextIsKept()
+    {
+        const string payload = """
+            {"op":0,"t":"GROUP_MESSAGE_CREATE","s":49,"d":{
+              "id":"MSG-7","content":"看这个<attachmentType=\"image/png\",attachmentIndex=0,description=\"eyJ0ZXh0IjoiW+WbvueJh10ifQ==\">",
+              "group_openid":"GRP",
+              "author":{"member_openid":"MEMBER-1"}}}
+            """;
+
+        var message = Map(payload);
+        Assert.NotNull(message);
+        Assert.Equal("看这个", message!.Content);
+    }
+
+    [Fact]
     public void UnknownShape_ReturnsNull()
     {
         var message = Map("""{"op":0,"t":"GROUP_MESSAGE_CREATE","s":47,"d":{"id":"X","content":"y"}}""");

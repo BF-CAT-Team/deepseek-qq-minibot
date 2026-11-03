@@ -42,6 +42,9 @@ public static class ParamRegistry
         // ---------------- 触发与会话 ----------------
         new("trigger_keywords", ParamType.StringList, CatTrigger, "关键词触发；空列表=关闭。多个用逗号分隔", new JsonArray(), BreaksCache: false),
         new("trigger_by_name", ParamType.Bool, CatTrigger, "消息里出现机器人名字也算触发（与 @ 同级）", JsonValue.Create(true)),
+        new("max_message_chars", ParamType.Int, CatTrigger,
+            "单条入站聊天内容的长度上限（字符）；超过就整条过滤，不进对话/历史/记忆，也不触发回复。0=不限",
+            JsonValue.Create(500), 0, 5000),
         new("backfill_max_msgs", ParamType.Int, CatTrigger,
             "被触发时，把「自上次回复以来群里的发言」补进上下文的最大条数；0=关闭", JsonValue.Create(12), 0, 50),
         new("backfill_window_min", ParamType.Int, CatTrigger,
@@ -88,7 +91,6 @@ public static class ParamRegistry
         new("weight_location", ParamType.Double, CatMemory, "地点匹配权重", JsonValue.Create(2d), 0, 10, BreaksCache: true),
         new("diversity_lambda", ParamType.Double, CatMemory, "结果多样性惩罚（M3 启用）", JsonValue.Create(0d), 0, 1, BreaksCache: true),
         new("max_ops_per_batch", ParamType.Int, CatMemory, "单批入库条数上限", JsonValue.Create(8), 1, 20),
-        new("person_materialize_min_msgs", ParamType.Int, CatMemory, "发言多少条才真正建档", JsonValue.Create(2), 1, 10, BreaksCache: true),
         new("name_learn_confirm_count", ParamType.Int, CatMemory, "他人称呼几次才认定为名字", JsonValue.Create(2), 1, 5, BreaksCache: true),
         new("self_open_id", ParamType.String, CatMemory, "机器人自身 open_id 白名单，防自建档", JsonValue.Create("")),
         new("mask_open_id_in_logs", ParamType.Bool, CatMemory, "日志中 open_id 脱敏（前 6 后 4）", JsonValue.Create(true)),

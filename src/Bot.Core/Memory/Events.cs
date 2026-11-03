@@ -84,6 +84,65 @@ public sealed class EventStore
             ? Load("1=1", limit)
             : Load("e.status=@s", limit, ("@s", status));
 
+    /// <summary>看板分页：最新的在前。<paramref name="query"/> 非空时走 FTS（不足 3 字退回 LIKE）。</summary>
+    public IReadOnlyList<EventRow> Page(string? query, int offset, int limit)
+    {
+        var trimmed = query?.Trim() ?? string.Empty;
+        if (trimmed.Length == 0)
+        {
+            return LoadPage("1=1", offset, limit);
+        }
+
+        if (trimmed.Length < 3)
+        {
+            return LoadPage("e.detail LIKE @q", offset, limit, ("@q", "%" + trimmed + "%"));
+        }
+
+        try
+        {
+            var ids = _db.Query(
+                "SELECT rowid FROM event_fts WHERE event_fts MATCH @q ORDER BY rank LIMIT @n OFFSET @o",
+                reader => reader.GetInt64(0),
+                ("@q", "\"" + trimmed.Replace("\"", "\"\"") + "\""),
+                ("@n", limit),
+                ("@o", offset));
+
+            return ids.Count == 0 ? Array.Empty<EventRow>() : LoadByIds(ids);
+        }
+        catch (SqliteException ex)
+        {
+            _log.LogWarning(ex, "FTS 检索失败，退化为 LIKE：{Query}", trimmed);
+            return LoadPage("e.detail LIKE @q", offset, limit, ("@q", "%" + trimmed + "%"));
+        }
+    }
+
+    /// <summary>与 <see cref="Page"/> 配套的总数（同一套过滤条件）。</summary>
+    public int Count(string? query)
+    {
+        var trimmed = query?.Trim() ?? string.Empty;
+        if (trimmed.Length == 0)
+        {
+            return (int)_db.ScalarLong("SELECT COUNT(*) FROM event");
+        }
+
+        if (trimmed.Length < 3)
+        {
+            return (int)_db.ScalarLong("SELECT COUNT(*) FROM event WHERE detail LIKE @q",
+                ("@q", "%" + trimmed + "%"));
+        }
+
+        try
+        {
+            return (int)_db.ScalarLong("SELECT COUNT(*) FROM event_fts WHERE event_fts MATCH @q",
+                ("@q", "\"" + trimmed.Replace("\"", "\"\"") + "\""));
+        }
+        catch (SqliteException)
+        {
+            return (int)_db.ScalarLong("SELECT COUNT(*) FROM event WHERE detail LIKE @q",
+                ("@q", "%" + trimmed + "%"));
+        }
+    }
+
     public EventRow? GetById(long eventId)
     {
         var rows = Load("e.event_id=@id", 1, ("@id", eventId));
@@ -254,6 +313,14 @@ public sealed class EventStore
         var normalized = Regex.Replace(detail.Trim(), @"\s+", " ");
         var bytes = Encoding.UTF8.GetBytes(normalized);
         return Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+    }
+
+    private IReadOnlyList<EventRow> LoadPage(string where, int offset, int limit,
+        params (string Name, object? Value)[] args)
+    {
+        var sql = $"SELECT {SelectColumns} FROM event e WHERE {where} ORDER BY e.event_id DESC LIMIT @n OFFSET @o";
+        var all = args.Append(("@n", (object?)limit)).Append(("@o", (object?)offset)).ToArray();
+        return _db.Query(sql, MapRow, all);
     }
 
     private IReadOnlyList<EventRow> Load(string where, int limit, params (string Name, object? Value)[] args)

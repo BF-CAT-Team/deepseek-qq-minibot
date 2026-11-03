@@ -3,7 +3,7 @@ namespace Bot.Core.Memory;
 /// <summary>文档 3.6 的 DDL。除原文列之外只加了两处：<c>chat.kind</c> 与 <c>person.union_open_id</c>（见注释）。</summary>
 public static class Schema
 {
-    public const int CurrentVersion = 2;
+    public const int CurrentVersion = 3;
 
     public const string Ddl = """
         -- 群/会话配置
@@ -139,6 +139,28 @@ public static class Schema
           content    TEXT NOT NULL,
           kind       TEXT NOT NULL DEFAULT 'history',
           PRIMARY KEY (session_id, seq)
+        );
+
+        -- 会话总结记录（v1.3 补充）：request_log 只有用量，看不到"总结问了什么、回了什么"。
+        -- 一个会话最多一条；messages 是发给模型的完整请求（前缀 + 全部回合 + 总结指令）。
+        CREATE TABLE IF NOT EXISTS session_summary (
+          session_id    TEXT PRIMARY KEY,
+          chat_id       TEXT NOT NULL,
+          request_id    TEXT NOT NULL,
+          model         TEXT NOT NULL,
+          created_at    INTEGER NOT NULL,
+          updated_at    INTEGER NOT NULL,
+          attempts      INTEGER NOT NULL DEFAULT 0,
+          reply         TEXT,
+          parse_ok      INTEGER NOT NULL DEFAULT 0,
+          is_none       INTEGER NOT NULL DEFAULT 0,
+          error_code    TEXT,
+          applied       INTEGER NOT NULL DEFAULT 0,
+          skipped       INTEGER NOT NULL DEFAULT 0,
+          batch_id      TEXT,
+          warnings      TEXT NOT NULL DEFAULT '[]',
+          applied_lines TEXT NOT NULL DEFAULT '[]',
+          messages      TEXT NOT NULL DEFAULT '[]'
         );
 
         -- 请求日志（成本与缓存分析的唯一事实来源）

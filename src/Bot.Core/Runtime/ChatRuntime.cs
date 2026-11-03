@@ -26,6 +26,7 @@ public sealed class ChatRuntime : IAsyncDisposable
     private readonly PromptAssembler _assembler;
     private readonly SessionManager _sessions;
     private readonly RequestLogStore _requestLog;
+    private readonly SummaryRecordStore _summaryRecords;
     private readonly WalStore _wal;
     private readonly SummaryApplier _summaryApplier;
     private readonly TokenEstimator _estimator;
@@ -68,6 +69,7 @@ public sealed class ChatRuntime : IAsyncDisposable
         _assembler = assembler;
         _sessions = sessions;
         _requestLog = requestLog;
+        _summaryRecords = new SummaryRecordStore(db);
         _wal = wal;
         _summaryApplier = summaryApplier;
         _estimator = estimator;
@@ -137,6 +139,17 @@ public sealed class ChatRuntime : IAsyncDisposable
     /// <summary>入站入口。适配器必须尽快返回，重活丢给调度循环。</summary>
     public Task EnqueueAsync(IncomingMessage message)
     {
+        var cfg = _config.ForChat(message.ChatId);
+
+        // 长度闸门：超长文本（粘贴的文章/日志/整段聊天记录）整条丢弃。
+        // 放在最前面，确保它不建档、不进 message 表、不进 Recent/Unseen/Pending，也不触发回复。
+        if (!message.IsSelf && cfg.MaxMessageChars > 0 && message.Content.Length > cfg.MaxMessageChars)
+        {
+            _log.LogInformation("[{Chat}] 聊天内容过长（{Length} 字 > 上限 {Limit}），已过滤：{Preview}",
+                Mask(message.ChatId), message.Content.Length, cfg.MaxMessageChars, ClipForLog(message.Content, 40));
+            return Task.CompletedTask;
+        }
+
         // 指令消息不进对话、不触发模型。
         if (!message.IsSelf && NameCommand.TryParse(message.Content, out var requestedName))
         {
@@ -171,7 +184,6 @@ public sealed class ChatRuntime : IAsyncDisposable
         }
 
         var botLabel = _config.Raw.Persona.BotName;
-        var cfg = _config.ForChat(message.ChatId);
 
         var person = message.IsSelf ? null : _identity.Resolve(message, botLabel);
         var label = message.IsSelf ? botLabel : person!.DisplayLabel;
@@ -591,7 +603,7 @@ public sealed class ChatRuntime : IAsyncDisposable
         }
 
         var tail = BuildTail(state, batch, Array.Empty<IncomingMessage>(),
-            Array.Empty<PersonRow>(), Array.Empty<EventRow>(), cfg);
+            Array.Empty<PersonRow>(), Array.Empty<EventRow>(), cfg, firstTurn: session.Turns.Count == 0);
         AppendTurn(state, session, new SessionTurn("user", tail.Text, TurnKind.Ambient));
         session.Touch(_clock.UtcNow);
         _sessions.SaveProgress(session);
@@ -695,7 +707,8 @@ public sealed class ChatRuntime : IAsyncDisposable
         }
 
         var (extraPersons, extraEvents) = BuildSupplement(state, batch, cfg);
-        var tail = BuildTail(state, batch, background, extraPersons, extraEvents, cfg);
+        var tail = BuildTail(state, batch, background, extraPersons, extraEvents, cfg,
+            firstTurn: session.Turns.Count == 0);
         if (tail.ScrubbedIds > 0)
         {
             _log.LogError("E_PROMPT_LEAK 动态尾部里出现了 {Count} 个不透明标识（open_id 形态），已替换为 <id>。"
@@ -891,7 +904,7 @@ public sealed class ChatRuntime : IAsyncDisposable
 
     private PromptTail BuildTail(ChatState state, IReadOnlyList<IncomingMessage> batch,
         IReadOnlyList<IncomingMessage> background, IReadOnlyList<PersonRow> extraPersons,
-        IReadOnlyList<EventRow> extraEvents, EffectiveConfig cfg)
+        IReadOnlyList<EventRow> extraEvents, EffectiveConfig cfg, bool firstTurn)
     {
         var tailMessages = batch.Select(m => new TailMessage(LabelOfLocked(state, m), m.Content)).ToArray();
         var backgroundMessages = background.Select(m => new TailMessage(LabelOfLocked(state, m), m.Content)).ToArray();
@@ -905,7 +918,8 @@ public sealed class ChatRuntime : IAsyncDisposable
             cfg.ReplyLength,
             backgroundMessages,
             extraPersons,
-            extraEvents));
+            extraEvents,
+            FirstTurn: firstTurn));
     }
 
     private async Task<bool> DeliverAsync(ChatState state, ReplyPlan plan, string? mentionOpenId, string idemKey,
@@ -1188,6 +1202,10 @@ public sealed class ChatRuntime : IAsyncDisposable
         var requestId = Guid.NewGuid().ToString("N")[..16];
         var maxTokens = Math.Max(256, _config.Raw.Llm.MaxOutputTokens);
 
+        // 先把"要发给模型的总结请求"落库：配置页点开会话时，看到的就是这份原文。
+        _summaryRecords.Begin(session.SessionId, state.ChatId, requestId, model,
+            messages.Select(m => new SummaryMessage(m.Role, m.Content)).ToArray(), TimeUtil.NowUnix());
+
         _requestLog.Insert(new RequestLogRow(
             requestId, session.SessionId, state.ChatId, 0, "summary", model, TimeUtil.NowUnix(),
             session.PrefixHash ?? string.Empty, session.PrefixTokens, null, null, null, null, null, null, null,
@@ -1200,6 +1218,7 @@ public sealed class ChatRuntime : IAsyncDisposable
         if (!result.Ok)
         {
             _log.LogWarning("[{Chat}] 总结请求失败 {Code}，写入 WAL", Mask(state.ChatId), result.ErrorCode);
+            _summaryRecords.Fail(session.SessionId, result.ErrorCode, TimeUtil.NowUnix());
             _wal.Add(session.SessionId, WalStore.KindSummary,
                 System.Text.Json.JsonSerializer.Serialize(new { chatId = state.ChatId, error = result.ErrorCode }));
             return;
@@ -1242,6 +1261,8 @@ public sealed class ChatRuntime : IAsyncDisposable
         if (!parsed.HasOps && !parsed.IsNone)
         {
             _log.LogError("[{Chat}] 总结解析失败，原文入 WAL（kind=summary_raw）", Mask(state.ChatId));
+            _summaryRecords.Complete(session.SessionId, result.Text, attempts, parseOk: false, isNone: false,
+                applied: 0, skipped: 0, batchId: null, parsed.Warnings, Array.Empty<string>(), TimeUtil.NowUnix());
             _wal.Add(session.SessionId, WalStore.KindSummaryRaw,
                 System.Text.Json.JsonSerializer.Serialize(new { chatId = state.ChatId, raw = result.Text }));
             return;
@@ -1250,6 +1271,8 @@ public sealed class ChatRuntime : IAsyncDisposable
         if (parsed.IsNone)
         {
             _log.LogInformation("[{Chat}] 本轮无新增记忆（NONE）", Mask(state.ChatId));
+            _summaryRecords.Complete(session.SessionId, result.Text, attempts, parseOk: true, isNone: true,
+                applied: 0, skipped: 0, batchId: null, parsed.Warnings, Array.Empty<string>(), TimeUtil.NowUnix());
         }
         else
         {
@@ -1265,6 +1288,10 @@ public sealed class ChatRuntime : IAsyncDisposable
             {
                 _log.LogWarning("[{Chat}] 入库告警：{Warning}", Mask(state.ChatId), warning);
             }
+
+            _summaryRecords.Complete(session.SessionId, result.Text, attempts, parseOk: true, isNone: false,
+                applied.Applied, applied.Skipped, applied.BatchId, applied.Warnings,
+                applied.AppliedDescriptions, TimeUtil.NowUnix());
         }
 
         var rolling = BuildRollingSummary(session.Turns);
@@ -1421,6 +1448,8 @@ public sealed class ChatRuntime : IAsyncDisposable
 
         var cfg = _config.ForChat(chatId);
         var applied = _summaryApplier.Apply(chatId, item.SessionId, parsed, cfg, new Dictionary<string, string>());
+        _summaryRecords.MarkApplied(item.SessionId, applied.BatchId, applied.Applied, applied.Skipped,
+            applied.Warnings, applied.AppliedDescriptions, TimeUtil.NowUnix());
         _log.LogInformation("WAL 重放总结：batch={Batch} 成功 {Applied}", applied.BatchId, applied.Applied);
         _wal.Remove(item.Id);
     }
@@ -1506,6 +1535,7 @@ public sealed class ChatRuntime : IAsyncDisposable
         builder.Append(cfg.Model).Append('|')
             .Append(persona.BotName).Append('|')
             .Append(persona.Persona).Append('|')
+            .Append(persona.Rules).Append('|')
             .Append(persona.ExtraRules);
 
         foreach (var spec in ParamRegistry.All.Where(s => s.BreaksCache))

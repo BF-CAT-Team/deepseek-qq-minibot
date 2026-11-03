@@ -17,9 +17,9 @@ public sealed class StickerTests
         var keywords = StickerMatch.ParseKeywords("笑死:2，哈哈：1.5;无语, 笑死:9");
 
         Assert.Equal(3, keywords.Count);
-        Assert.Equal(new StickerKeyword("笑死", 2), keywords[0]);
-        Assert.Equal(new StickerKeyword("哈哈", 1.5), keywords[1]);
-        Assert.Equal(new StickerKeyword("无语", 1), keywords[2]);
+        Assert.Equal(new StickerKeyword("笑死", 2m), keywords[0]);
+        Assert.Equal(new StickerKeyword("哈哈", 1.5m), keywords[1]);
+        Assert.Equal(new StickerKeyword("无语", 1m), keywords[2]);
     }
 
     [Fact]
@@ -29,7 +29,7 @@ public sealed class StickerTests
 
         Assert.Equal(2, keywords.Count);
         Assert.Equal("笑死:很多", keywords[0].Word);
-        Assert.Equal(1, keywords[0].Weight);
+        Assert.Equal(1m, keywords[0].Weight);
         // 0 不是合法权重，整串当关键词处理，随后靠文本匹配自然淘汰。
         Assert.Equal("好:0", keywords[1].Word);
     }
@@ -42,13 +42,13 @@ public sealed class StickerTests
         var score = StickerMatch.Score("笑笑笑，笑死", sticker, threshold: 8);
 
         // 4 次「笑」× 2 分 = 8
-        Assert.Equal(8, score.Score);
+        Assert.Equal(8m, score.Score);
         Assert.Single(score.Hits);
         Assert.Equal(4, score.Hits[0].Count);
         Assert.True(score.MeetsThreshold);
 
         // 阈值是全局参数：差 0.1 就不算过。
-        Assert.False(StickerMatch.Score("笑笑笑，笑死", sticker, threshold: 8.1).MeetsThreshold);
+        Assert.False(StickerMatch.Score("笑笑笑，笑死", sticker, threshold: 8.1m).MeetsThreshold);
     }
 
     [Fact]
@@ -64,13 +64,61 @@ public sealed class StickerTests
 
         Assert.NotNull(best);
         Assert.Equal(2, best!.Sticker.StickerId);
-        Assert.Equal(5, best.Score);
+        Assert.Equal(5m, best.Score);
 
         // 同分取 id 小的，保证结果可预期。
         var first = new StickerRow(5, "a.png", string.Empty, "image/png", "笑", true, 0, null, 0, 0);
         var second = new StickerRow(6, "b.png", string.Empty, "image/png", "笑", true, 0, null, 0, 0);
         var tie = StickerMatch.Best(StickerMatch.Score("笑", new[] { second, first }, threshold: 1));
         Assert.Equal(5, tie!.Sticker.StickerId);
+    }
+
+    [Fact]
+    public void Score_DecimalWeights_AreExactAtTheBoundary()
+    {
+        var sticker = new StickerRow(1, "a.png", string.Empty, "image/png", "笑:1.005", true, 0, null, 0, 0);
+
+        var exact = StickerMatch.Score("笑", sticker, threshold: 1.005m);
+
+        // 旧实现先 Math.Round(1.005, 2) = 1.00，会误判为不过阈值。
+        Assert.Equal(1.005m, exact.Score);
+        Assert.True(exact.MeetsThreshold);
+        Assert.False(StickerMatch.Score("笑", sticker, threshold: 1.006m).MeetsThreshold);
+    }
+
+    [Fact]
+    public void Score_ZeroOnePlusZeroTwo_EqualsZeroThree()
+    {
+        var sticker = new StickerRow(1, "a.png", string.Empty, "image/png", "笑:0.1, 哈:0.2", true, 0, null, 0, 0);
+
+        var score = StickerMatch.Score("笑哈", sticker, threshold: 0.3m);
+
+        // double 会算成 0.30000000000000004；decimal 精确等于 0.3。
+        Assert.Equal(0.3m, score.Score);
+        Assert.True(score.MeetsThreshold);
+    }
+
+    [Fact]
+    public void Score_DoesNotRoundBeforeThresholdComparison()
+    {
+        var sticker = new StickerRow(1, "a.png", string.Empty, "image/png", "笑:1.9951", true, 0, null, 0, 0);
+
+        // 真实得分 1.9951 < 1.9955；旧实现四舍五入成 2.00 会误判为通过。
+        Assert.False(StickerMatch.Score("笑", sticker, threshold: 1.9955m).MeetsThreshold);
+    }
+
+    [Fact]
+    public void Best_ComparesUnroundedScores()
+    {
+        var lower = new StickerRow(1, "a.png", string.Empty, "image/png", "笑:2.341", true, 0, null, 0, 0);
+        var higher = new StickerRow(2, "b.png", string.Empty, "image/png", "笑:2.344", true, 0, null, 0, 0);
+
+        var best = StickerMatch.Best(StickerMatch.Score("笑", new[] { lower, higher }, threshold: 1m));
+
+        // 旧实现两张都变成 2.34，会按 id 选中较低的那张。
+        Assert.NotNull(best);
+        Assert.Equal(2, best!.Sticker.StickerId);
+        Assert.Equal(2.344m, best.Score);
     }
 
     [Fact]

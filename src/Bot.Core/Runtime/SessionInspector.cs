@@ -44,6 +44,33 @@ public sealed record SessionBrief(
     public long LastAt => EndedAt ?? StartedAt;
 }
 
+/// <summary>总结请求里的一条 message（与真正发给模型的 role / content 一致）。</summary>
+public sealed record SessionSummaryMessageView(string Role, string Content, int Tokens);
+
+/// <summary>
+/// 一次会话结束时做的总结：<b>发给模型的请求原文 + 模型返回的总结原文 + 解析/入库结果</b>。
+/// <para>
+/// 只靠 request_log 只能看到一行 <c>summary</c> 的用量，看不到总结到底说了什么；
+/// 用户点进会话时最容易产生的疑问正好是"它到底记住了什么"，所以这份记录必须能回看。
+/// 记录从 v1.3 起才有，老会话在这里是 <c>null</c>。
+/// </para>
+/// </summary>
+public sealed record SessionSummaryView(
+    string RequestId,
+    string Model,
+    long CreatedAt,
+    int Attempts,
+    string? Reply,
+    bool ParseOk,
+    bool IsNone,
+    string? ErrorCode,
+    int Applied,
+    int Skipped,
+    string? BatchId,
+    IReadOnlyList<string> Warnings,
+    IReadOnlyList<string> AppliedLines,
+    IReadOnlyList<SessionSummaryMessageView> Messages);
+
 /// <summary>
 /// 一个会话的"API 侧"视图：<b>发给模型的 messages 长什么样</b>。
 /// <para>
@@ -73,6 +100,9 @@ public sealed record SessionView(
 {
     /// <summary>运行时状态（idle/active/summarizing/closed）。会话不在内存里时为 null。</summary>
     public string? LiveState { get; init; }
+
+    /// <summary>会话结束时的总结；未总结 / v1.3 之前的老会话为 null。</summary>
+    public SessionSummaryView? Summary { get; init; }
 }
 
 /// <summary>
@@ -84,6 +114,7 @@ public sealed class SessionInspector
     private readonly Db _db;
     private readonly SessionManager _sessions;
     private readonly RequestLogStore _requests;
+    private readonly SummaryRecordStore _summaryRecords;
     private readonly TokenEstimator _estimator;
 
     public SessionInspector(Db db, SessionManager sessions, RequestLogStore requests, TokenEstimator estimator)
@@ -91,6 +122,7 @@ public sealed class SessionInspector
         _db = db;
         _sessions = sessions;
         _requests = requests;
+        _summaryRecords = new SummaryRecordStore(db);
         _estimator = estimator;
     }
 
@@ -185,6 +217,8 @@ public sealed class SessionInspector
         var state = row.EndedAt is null ? "active" : "closed";
         var kind = string.IsNullOrEmpty(row.Kind) ? ChatKind.Group.ToString().ToLowerInvariant() : row.Kind;
 
+        var summary = BuildSummary(sessionId);
+
         return new SessionView(
             row.SessionId,
             row.ChatId,
@@ -202,7 +236,38 @@ public sealed class SessionInspector
             row.TokenCached,
             row.TokenOut,
             turns,
-            requests);
+            requests)
+        {
+            Summary = summary,
+        };
+    }
+
+    private SessionSummaryView? BuildSummary(string sessionId)
+    {
+        var record = _summaryRecords.Get(sessionId);
+        if (record is null)
+        {
+            return null;
+        }
+
+        return new SessionSummaryView(
+            record.RequestId,
+            record.Model,
+            record.CreatedAt,
+            record.Attempts,
+            record.Reply,
+            record.ParseOk,
+            record.IsNone,
+            record.ErrorCode,
+            record.Applied,
+            record.Skipped,
+            record.BatchId,
+            record.Warnings,
+            record.AppliedLines,
+            record.Messages
+                .Select(m => new SessionSummaryMessageView(m.Role, m.Content,
+                    string.IsNullOrEmpty(m.Content) ? 0 : _estimator.EstimateMessages(new[] { m.Content })))
+                .ToArray());
     }
 
     /// <summary>前端用的 snake_case 名称（<c>TurnKind.ToString()</c> 会给出 Dynamictail）。</summary>

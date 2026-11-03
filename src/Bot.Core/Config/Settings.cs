@@ -83,6 +83,12 @@ public sealed class PersonaSettings
 
     /// <summary>追加到规则块末尾的额外约束（按群可覆盖，M4）。</summary>
     public string ExtraRules { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 自定义「规则」块（空 = 用内置默认）。支持占位符 <c>{名字}</c> / <c>{场景}</c> / <c>{字数}</c>；
+    /// 它属于前缀区，改动会让当前会话在下次空闲时自动重建。
+    /// </summary>
+    public string Rules { get; set; } = string.Empty;
 }
 
 public sealed class ServerSettings
@@ -129,9 +135,11 @@ public static class SettingsStore
 
             // reply_length 从"极简/简短/标准"改成数值：旧配置不迁移的话会落回默认值 + 一条告警。
             MigrateLegacyReplyLength(settings.Parameters);
+            RemoveObsoleteParameters(settings.Parameters);
             foreach (var chat in settings.Chats.Values)
             {
                 MigrateLegacyReplyLength(chat.Parameters);
+                RemoveObsoleteParameters(chat.Parameters);
             }
 
             return settings;
@@ -154,6 +162,12 @@ public static class SettingsStore
                 _ => 40,
             };
         }
+    }
+
+    /// <summary>已删除的参数从旧配置里移除，避免启动时刷"未知参数"告警。</summary>
+    private static void RemoveObsoleteParameters(JsonObject? parameters)
+    {
+        parameters?.Remove("person_materialize_min_msgs");
     }
 
     public static void Save(string path, AppSettings settings)
@@ -207,6 +221,12 @@ public sealed class EffectiveConfig
     public IReadOnlyList<string> TriggerKeywords => Params.GetStringList("trigger_keywords");
 
     public bool TriggerByName => Params.GetBool("trigger_by_name");
+
+    /// <summary>
+    /// 单条入站消息的字符上限；0=不限。超过上限的消息整条丢弃（不建档、不入历史、不触发回复），
+    /// 防止粘贴的长文/聊天记录把 token 预算和上下文一口气撑爆。
+    /// </summary>
+    public int MaxMessageChars => Params.GetInt("max_message_chars");
 
     /// <summary>被触发时补进上下文的"旁听"消息上限（0=关闭）。</summary>
     public int BackfillMaxMsgs => Params.GetInt("backfill_max_msgs");
@@ -286,8 +306,6 @@ public sealed class EffectiveConfig
 
     public int MaxOpsPerBatch => Params.GetInt("max_ops_per_batch");
 
-    public int PersonMaterializeMinMsgs => Params.GetInt("person_materialize_min_msgs");
-
     public int NameLearnConfirmCount => Params.GetInt("name_learn_confirm_count");
 
     public string SelfOpenId => Params.GetString("self_open_id");
@@ -323,8 +341,8 @@ public sealed class EffectiveConfig
     /// <summary>选出得分最高的表情包后，真正发送的概率（全局）。</summary>
     public double StickerProbability => Params.GetDouble("sticker_probability");
 
-    /// <summary>触发最低权重（全局）：所有图片共用这一个阈值。</summary>
-    public double StickerMinWeight => Params.GetDouble("sticker_min_weight");
+    /// <summary>触发最低权重（全局）：所有图片共用这一个阈值。用 decimal 参与精确比较。</summary>
+    public decimal StickerMinWeight => (decimal)Params.GetDouble("sticker_min_weight");
 
     /// <summary>同一个聊天两次表情包之间的最小间隔（秒）；0=不限。</summary>
     public int StickerCooldownSec => Params.GetInt("sticker_cooldown_sec");

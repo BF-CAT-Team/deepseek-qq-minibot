@@ -53,7 +53,6 @@ public sealed class QqGateway : IAsyncDisposable
 
     private readonly QqApi _api;
     private readonly ILogger<QqGateway> _log;
-    private readonly ClientWebSocket _socket = new();
 
     private readonly object _statusGate = new();
     private GatewayState _state = GatewayState.Stopped;
@@ -106,6 +105,7 @@ public sealed class QqGateway : IAsyncDisposable
         var attempt = 0;
         while (!cancellationToken.IsCancellationRequested)
         {
+            var attemptStartedAt = DateTimeOffset.UtcNow;
             try
             {
                 if (attempt == 0)
@@ -114,17 +114,33 @@ public sealed class QqGateway : IAsyncDisposable
                 }
 
                 await ConnectAndListenAsync(cancellationToken).ConfigureAwait(false);
-                backoff = TimeSpan.FromSeconds(1);
+
+                // 只活了几秒就断，说明不是正常轮换（平台会以 4008"连接太快"拒绝），
+                // 退避必须继续长；活过一分钟才把退避重置回 1s。
+                if (DateTimeOffset.UtcNow - attemptStartedAt > TimeSpan.FromSeconds(60))
+                {
+                    backoff = TimeSpan.FromSeconds(1);
+                }
+
                 SetState(GatewayState.Reconnecting, "网关连接被关闭，准备重连");
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 break;
             }
             catch (Exception ex)
             {
                 _log.LogError(ex, "网关连接异常，{Backoff} 后重连", backoff);
-                Fatal?.Invoke(ex.Message);
+                try
+                {
+                    Fatal?.Invoke(ex.Message);
+                }
+                catch (Exception handlerError)
+                {
+                    // 订阅方（托盘/告警）出错不能把重连循环一起带走。
+                    _log.LogError(handlerError, "Fatal 处理器异常（已忽略）");
+                }
+
                 SetState(GatewayState.Reconnecting, ex.Message);
             }
 
@@ -220,14 +236,9 @@ public sealed class QqGateway : IAsyncDisposable
             _gatewayUrl = gatewayUrl;
         }
 
-        if (_socket.State is WebSocketState.Open or WebSocketState.Connecting)
-        {
-            _socket.Abort();
-        }
-
         _log.LogInformation("正在连接 QQ 网关 {Url}", gatewayUrl);
 
-        var socket = new ClientWebSocket();
+        using var socket = new ClientWebSocket();
         // WebSocket 握手没有默认超时，网络被墙时会静默挂很久。必须自己设上限。
         using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         connectCts.CancelAfter(TimeSpan.FromSeconds(20));
@@ -237,13 +248,7 @@ public sealed class QqGateway : IAsyncDisposable
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            socket.Dispose();
             throw new TimeoutException("连接 QQ 网关超时（20s）");
-        }
-        catch
-        {
-            socket.Dispose();
-            throw;
         }
 
         _log.LogInformation("已连接 QQ 网关 {Url}", gatewayUrl);
@@ -252,29 +257,92 @@ public sealed class QqGateway : IAsyncDisposable
         var buffer = new byte[16 * 1024];
         var assembly = new MemoryStream();
 
-        while (!cancellationToken.IsCancellationRequested && socket.State == WebSocketState.Open)
+        try
         {
-            assembly.SetLength(0);
-            WebSocketReceiveResult result;
-            do
+            while (!cancellationToken.IsCancellationRequested && socket.State == WebSocketState.Open)
             {
-                result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken).ConfigureAwait(false);
-                if (result.MessageType == WebSocketMessageType.Close)
+                assembly.SetLength(0);
+                WebSocketReceiveResult result;
+                do
                 {
-                    _log.LogWarning("网关请求关闭：{Status} {Description}", result.CloseStatus, result.CloseStatusDescription);
+                    result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken).ConfigureAwait(false);
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        var closeCode = (int?)result.CloseStatus;
+                        _log.LogWarning("网关请求关闭：{Status} {Description}", result.CloseStatus, result.CloseStatusDescription);
+                        if (closeCode == 4004)
+                        {
+                            // token 被判无效：不换票的话，后续每次 IDENTIFY 都会以同样的关闭码失败。
+                            _api.InvalidateToken();
+                            _log.LogWarning("关闭码 4004 表示 token 无效，已丢弃缓存的 access_token，下次连接重新换取");
+                        }
+
+                        if (ShouldResetSession(closeCode))
+                        {
+                            ResetSession($"关闭码 {closeCode} 表明会话已失效");
+                        }
+
+                        return;
+                    }
+
+                    assembly.Write(buffer, 0, result.Count);
+                }
+                while (!result.EndOfMessage);
+
+                var json = Encoding.UTF8.GetString(assembly.GetBuffer(), 0, (int)assembly.Length);
+                var keepGoing = await HandlePayloadAsync(json, socket, token, cancellationToken).ConfigureAwait(false);
+                if (!keepGoing)
+                {
                     return;
                 }
-
-                assembly.Write(buffer, 0, result.Count);
             }
-            while (!result.EndOfMessage);
+        }
+        finally
+        {
+            // 每次断开都要把心跳和 socket 收干净：半开的连接不只泄漏句柄，
+            // 心跳还会继续往死连接里写，下一次重连的状态就全是假的。
+            StopHeartbeat();
+            await CloseQuietlyAsync(socket).ConfigureAwait(false);
+        }
+    }
 
-            var json = Encoding.UTF8.GetString(assembly.GetBuffer(), 0, (int)assembly.Length);
-            var keepGoing = await HandlePayloadAsync(json, socket, token, cancellationToken).ConfigureAwait(false);
-            if (!keepGoing)
+    private static async Task CloseQuietlyAsync(ClientWebSocket socket)
+    {
+        try
+        {
+            if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
-                return;
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "reconnect", cts.Token)
+                    .ConfigureAwait(false);
             }
+        }
+        catch
+        {
+            // 关不掉也不影响重连，Dispose 会兜底。
+        }
+    }
+
+    /// <summary>这些关闭码表示"会话已不能 RESUME"，下次必须重新 IDENTIFY。</summary>
+    public static bool ShouldResetSession(int? closeCode) => closeCode is 4006 or 4007 or 4009;
+
+    /// <summary>心跳 ack 超时判定：超过 2.5 个心跳周期没收到 ack，就认为连接已经半死。</summary>
+    public static bool HeartbeatTimedOut(DateTimeOffset lastAckAt, DateTimeOffset now, TimeSpan interval) =>
+        now - lastAckAt > TimeSpan.FromMilliseconds(interval.TotalMilliseconds * 2.5);
+
+    private void ResetSession(string reason)
+    {
+        string? previous;
+        lock (_statusGate)
+        {
+            previous = _sessionId;
+            _sessionId = null;
+        }
+
+        _lastSeq = -1;
+        if (previous is not null)
+        {
+            _log.LogInformation("清空网关会话（{Reason}），下次连接重新 IDENTIFY", reason);
         }
     }
 
@@ -323,6 +391,15 @@ public sealed class QqGateway : IAsyncDisposable
                     }
 
                     MarkOnline(readySession);
+                    return true;
+                }
+
+                if (string.Equals(type, "RESUMED", StringComparison.Ordinal))
+                {
+                    // 服务端 op7 要求重连后走的是 RESUME：没有新的 READY，但会话已经恢复。
+                    // 不在这里把状态拉回 Online，配置页会一直显示"正在连接"，看起来像没重连上。
+                    _log.LogInformation("网关会话已恢复（RESUMED）");
+                    MarkOnline(null);
                     return true;
                 }
 
@@ -376,12 +453,7 @@ public sealed class QqGateway : IAsyncDisposable
 
             case OpInvalidSession:
                 _log.LogWarning("会话失效，下次连接重新 identify");
-                lock (_statusGate)
-                {
-                    _sessionId = null;
-                }
-
-                _lastSeq = -1;
+                ResetSession("收到 op9 会话失效");
                 return false;
 
             default:
@@ -414,10 +486,17 @@ public sealed class QqGateway : IAsyncDisposable
 
     private void StartHeartbeat(ClientWebSocket socket, int intervalMs, CancellationToken cancellationToken)
     {
-        _heartbeatCts?.Cancel();
-        _heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var token = _heartbeatCts.Token;
+        StopHeartbeat();
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _heartbeatCts = cts;
+        var token = cts.Token;
         var delay = TimeSpan.FromMilliseconds(Math.Max(5000, intervalMs));
+
+        // 建立连接本身就是一次"活着"的证据；ack 之后每次都会被刷新。
+        lock (_statusGate)
+        {
+            _lastHeartbeatAt = DateTimeOffset.UtcNow;
+        }
 
         _ = Task.Run(async () =>
         {
@@ -428,6 +507,23 @@ public sealed class QqGateway : IAsyncDisposable
                     await Task.Delay(delay, token).ConfigureAwait(false);
                     if (socket.State != WebSocketState.Open)
                     {
+                        return;
+                    }
+
+                    DateTimeOffset lastAck;
+                    lock (_statusGate)
+                    {
+                        lastAck = _lastHeartbeatAt ?? DateTimeOffset.UtcNow;
+                    }
+
+                    // 半开连接看门狗：网线拔了 / 休眠 / NAT 超时，ReceiveAsync 会一直挂着不报错。
+                    // 没有 ack 就说明这条连接已经聋了，主动 Abort 让它走正常重连，而不是"假在线"。
+                    if (HeartbeatTimedOut(lastAck, DateTimeOffset.UtcNow, delay))
+                    {
+                        _log.LogWarning("心跳 {Seconds:F0}s 没有 ack，判定连接已失效，主动断开重连",
+                            (DateTimeOffset.UtcNow - lastAck).TotalSeconds);
+                        SetState(GatewayState.Reconnecting, "心跳超时，准备重连");
+                        socket.Abort();
                         return;
                     }
 
@@ -447,6 +543,27 @@ public sealed class QqGateway : IAsyncDisposable
         }, token);
     }
 
+    private void StopHeartbeat()
+    {
+        var cts = _heartbeatCts;
+        _heartbeatCts = null;
+        if (cts is null)
+        {
+            return;
+        }
+
+        try
+        {
+            cts.Cancel();
+        }
+        catch
+        {
+            // ignore
+        }
+
+        cts.Dispose();
+    }
+
     private static async Task SendAsync(ClientWebSocket socket, object payload, CancellationToken cancellationToken)
     {
         var json = JsonSerializer.Serialize(payload);
@@ -455,25 +572,12 @@ public sealed class QqGateway : IAsyncDisposable
             .ConfigureAwait(false);
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
+        // 具体的 socket 由每次连接自己持有（ConnectAndListenAsync 的 finally 负责关闭）。
         SetState(GatewayState.Stopped, null);
-        _heartbeatCts?.Cancel();
-        _heartbeatCts?.Dispose();
-        if (_socket.State == WebSocketState.Open)
-        {
-            try
-            {
-                await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None)
-                    .ConfigureAwait(false);
-            }
-            catch
-            {
-                // ignore
-            }
-        }
-
-        _socket.Dispose();
+        StopHeartbeat();
+        return ValueTask.CompletedTask;
     }
     private static string Truncate(string text, int limit) =>
         text.Length <= limit ? text : text[..limit] + "…";
@@ -642,6 +746,10 @@ public static class QqPayloadMapper
         cleaned = cleaned.Replace("<@all>", "@全体成员", StringComparison.OrdinalIgnoreCase);
         cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, "<@([^>]*)>", "@某人");
         cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, "<qqbot-at-user[^>]*/>", string.Empty);
+        // 图片/附件在 content 里是一串 <attachmentType=...,description="base64">，对模型是噪音。
+        cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned,
+            @"<(?:attachment|img|image)[^>]*>", string.Empty,
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         // 群里的表情会以 <faceType=1,faceId="314",ext="..."> 形式下发，留着只会白烧 token。
         cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, "<faceType=[^>]*>", "[表情]");
         cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"(\[表情\])+", "[表情]");
@@ -663,7 +771,20 @@ public static class QqPayloadMapper
 
         return data.TryGetProperty("content", out var contentElement)
                && contentElement.ValueKind == JsonValueKind.String
-               && !string.IsNullOrWhiteSpace(contentElement.GetString());
+               && HasVisibleText(contentElement.GetString());
+    }
+
+    private static bool HasVisibleText(string? content)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return false;
+        }
+
+        var withoutMedia = System.Text.RegularExpressions.Regex.Replace(content,
+            @"<(?:attachment|img|image)[^>]*>", string.Empty,
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return !string.IsNullOrWhiteSpace(withoutMedia);
     }
 
     private static string? Trim(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();

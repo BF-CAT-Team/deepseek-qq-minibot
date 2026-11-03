@@ -55,9 +55,6 @@ public sealed class IdentityService
     private readonly MemoryOpLog _opLog;
     private readonly object _gate = new();
     private readonly Dictionary<(string ChatId, string OpenId), PersonRef> _cache = new();
-    private readonly Dictionary<(string ChatId, string OpenId), int> _observations = new();
-    private readonly Dictionary<(string ChatId, string OpenId), string> _tempLabels = new();
-    private readonly Dictionary<string, int> _tempSeq = new(StringComparer.Ordinal);
 
     public IdentityService(Db db, ConfigService config, IClock clock, MemoryOpLog opLog)
     {
@@ -108,23 +105,11 @@ public sealed class IdentityService
                 return ref0;
             }
 
-            var observed = _observations.TryGetValue(key, out var count) ? count + 1 : 1;
-            _observations[key] = observed;
-
-            var shouldMaterialize = observed >= cfg.PersonMaterializeMinMsgs
-                || message.MentionsBot
-                || !string.IsNullOrWhiteSpace(message.ReplyToMessageId);
-
-            if (shouldMaterialize)
-            {
-                var created = Materialize(message, observed);
-                _observations.Remove(key);
-                _cache[key] = created;
-                return created;
-            }
-
-            var temp = TempLabel(key);
-            return new PersonRef(0, message.OpenId, temp, string.Empty, "none", false, temp, false);
+            // 首次发言就建档：拿到稳定的 person_id / 群友NN 标签。
+            // 空档案不会进前缀（HasProfile 会过滤），所以不会因为"先建档"而多烧 prompt。
+            var created = Materialize(message, 1);
+            _cache[key] = created;
+            return created;
         }
     }
 
@@ -220,6 +205,21 @@ public sealed class IdentityService
     public IReadOnlyList<PersonRow> ListActive(int limit = 200) =>
         _db.Query($"SELECT {PersonSql.Columns} FROM person p WHERE p.status='active' ORDER BY p.person_id LIMIT @n",
             PersonSql.Map, ("@n", limit));
+
+    /// <summary>配置页分页：最近更新的人物在前。</summary>
+    public IReadOnlyList<PersonRow> ListActivePage(int offset, int limit) =>
+        _db.Query(
+            $"""
+             SELECT {PersonSql.Columns} FROM person p
+             WHERE p.status='active'
+             ORDER BY p.updated_at DESC, p.person_id DESC
+             LIMIT @n OFFSET @o
+             """,
+            PersonSql.Map,
+            ("@n", limit),
+            ("@o", offset));
+
+    public int CountActive() => (int)_db.ScalarLong("SELECT COUNT(*) FROM person WHERE status='active'");
 
     /// <summary>人物记忆在前缀里按 person_id 升序拼接（文档 1.3 铁律 4）。</summary>
     public IReadOnlyList<PersonRow> ListForPrefix(string chatId, int limit = 60) =>
@@ -731,7 +731,7 @@ public sealed class IdentityService
         }
     }
 
-    /// <summary>轮换后调用：清掉标签缓存与临时标签序列，让新会话重新计算标签。</summary>
+    /// <summary>轮换后调用：清掉标签缓存，让新会话重新计算标签。</summary>
     public void ResetSession(string chatId)
     {
         lock (_gate)
@@ -741,12 +741,6 @@ public sealed class IdentityService
                 _cache.Remove(key);
             }
 
-            foreach (var key in _tempLabels.Keys.Where(k => k.ChatId == chatId).ToArray())
-            {
-                _tempLabels.Remove(key);
-            }
-
-            _tempSeq.Remove(chatId);
             foreach (var person in ListForPrefix(chatId))
             {
                 RecomputeLabel(person.PersonId);
@@ -872,27 +866,6 @@ public sealed class IdentityService
             ("@n", name), ("@id", personId));
 
         return duplicates > 0 ? $"{name}({Labels.Person(personId)})" : name;
-    }
-
-    private string TempLabel((string ChatId, string OpenId) key)
-    {
-        if (_tempLabels.TryGetValue(key, out var existing))
-        {
-            return existing;
-        }
-
-        var seq = _tempSeq.TryGetValue(key.ChatId, out var current) ? current : 0;
-        _tempSeq[key.ChatId] = seq + 1;
-        var label = "路人" + Ordinal(seq);
-        _tempLabels[key] = label;
-        return label;
-    }
-
-    private static string Ordinal(int index)
-    {
-        var letter = (char)('A' + (index % 26));
-        var round = index / 26;
-        return round == 0 ? letter.ToString() : letter + round.ToString();
     }
 
     private static string NormalizeLabel(string? label)

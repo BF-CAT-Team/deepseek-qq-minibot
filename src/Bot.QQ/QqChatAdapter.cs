@@ -121,8 +121,44 @@ public sealed class QqChatAdapter : IChatAdapter
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _log.LogInformation("启动 QQ 官方机器人网关");
-        _run = _gateway.RunAsync(cancellationToken);
+        _run = RunSupervisedAsync(cancellationToken);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 网关主循环的看护。<c>RunAsync</c> 自己会重连，但只要它意外退出（未处理异常 / 误判取消），
+    /// 进程还活着、配置页还显示"正在重连"，实际再也连不回来。这里兜底：退一次就重启一次。
+    /// </summary>
+    private async Task RunSupervisedAsync(CancellationToken cancellationToken)
+    {
+        var restarts = 0;
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await _gateway.RunAsync(cancellationToken).ConfigureAwait(false);
+                return; // 只有正常取消才会走到这里
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                restarts++;
+                _log.LogError(ex, "网关主循环异常退出（第 {Restarts} 次），{Delay}s 后重启", restarts,
+                    Math.Min(30, 2 * restarts));
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, 2 * restarts)), cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
+        }
     }
 
     public async Task SendAsync(OutgoingMessage message, CancellationToken cancellationToken)
